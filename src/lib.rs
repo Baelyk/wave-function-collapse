@@ -142,7 +142,6 @@ impl Patterns {
     fn new(patterns: Counter<Pattern>, width: usize, height: usize) -> Self {
         let mut info = HashMap::with_capacity(patterns.len());
 
-        // TODO: I'm dubious on the merit of these enumerates
         // Find the others this pattern can overlap with
         patterns
             .iter()
@@ -180,11 +179,19 @@ impl Patterns {
         self.info.get(&pattern).unwrap().0 as f32 / self.len() as f32
     }
 
-    fn frequencies(&self, mask: &Vec<bool>) -> Vec<u32> {
-        self.info
-            .values()
-            .enumerate()
-            .map(|(i, &(c, _))| if mask[i] { c } else { 0 })
+    fn get_pattern_occurances(&self, pattern: usize) -> u32 {
+        self.info.get(&pattern).unwrap().0
+    }
+
+    fn frequencies(&self, mask: &HashSet<usize>) -> Vec<u32> {
+        (0..self.len())
+            .map(|i| {
+                if mask.contains(&i) {
+                    self.info.get(&i).unwrap().0
+                } else {
+                    0
+                }
+            })
             .collect()
     }
 
@@ -201,11 +208,6 @@ impl Patterns {
 type Image = image::RgbImage; // image::ImageBuffer<Rgb<u8>, Vec<u8>>;
 
 fn find_patterns(image: &Image, n: u32, m: u32) -> Patterns {
-    //let image = ImageReader::open("data/SimpleKnot.png")
-    //.unwrap()
-    //.decode()
-    //.unwrap()
-    //.to_rgb8();
     let (width, height) = image.dimensions();
 
     // TODO: Augment pattern data with rotations and reflections
@@ -221,7 +223,6 @@ fn find_patterns(image: &Image, n: u32, m: u32) -> Patterns {
                     pixels.push(*pixel);
                 }
             }
-            println!("({x}, {y}) is {:?}", image.get_pixel(x, y));
             patterns.insert(Pattern { pixels });
         }
     }
@@ -229,17 +230,19 @@ fn find_patterns(image: &Image, n: u32, m: u32) -> Patterns {
     Patterns::new(patterns, n as usize, m as usize)
 }
 
-fn calculate_entropy(mask: &Vec<bool>, patterns: &Patterns) -> f32 {
-    let frequencies = patterns.frequencies(mask);
-    let total: u32 = frequencies.iter().sum();
-    -mask
+fn calculate_entropy(mask: &HashSet<usize>, patterns: &Patterns) -> f32 {
+    // Entropy is -sum(p_i * log(p_i)), p_i = occurences_of_i / all_occurences
+    let frequencies: Vec<f32> = patterns
+        .frequencies(mask)
+        .into_iter()
+        .map(|f| f as f32)
+        .filter(|f| *f != 0.0)
+        .collect();
+    let total: f32 = frequencies.iter().sum();
+    -frequencies
         .iter()
-        .enumerate()
-        .filter(|&(_, possible)| *possible)
-        .map(|(i, _)| {
-            let p = frequencies[i] as f32 / total as f32;
-            p * p.log2()
-        })
+        .map(|f| f / total)
+        .map(|p| p * p.ln())
         .sum::<f32>()
 }
 
@@ -301,22 +304,19 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
     // Output gif setup
     let mut file = File::create("data/output.gif").unwrap();
     let mut encoder = image::codecs::gif::GifEncoder::new(file);
+    encoder
+        .set_repeat(image::codecs::gif::Repeat::Infinite)
+        .unwrap();
 
     println!("Finding patterns");
     let patterns = find_patterns(image, n, m);
-    (0..patterns.len()).for_each(|i| {
-        println!("{i}:");
-        DIRECTIONS.iter().for_each(|direction| {
-            println!(
-                "  {:?}: {:?}",
-                direction,
-                patterns.compatibles(i, direction)
-            );
-        });
-    });
 
     println!("Creating wave");
-    let mut wave = vec![vec![true; patterns.len()]; (width * height) as usize];
+    let all_patterns: HashSet<usize> = (0..patterns.len()).collect();
+    let mut wave: Vec<HashSet<usize>> = (0..(width * height))
+        .map(|_| HashSet::from(all_patterns.clone()))
+        .collect();
+    println!("freqs: {:?}", patterns.frequencies(&wave[0]));
     println!("Calculating entropies");
     let mut entropy: Vec<f32> = wave
         .iter()
@@ -325,6 +325,9 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
 
     // maybe just use reduce instead of min
     let mut iter_num = 0;
+    let mut now = std::time::Instant::now();
+    let mut spent = vec![];
+    let mut rng = thread_rng();
     while let Some((min_entropy_index, _)) = entropy
         .iter()
         .enumerate()
@@ -332,11 +335,13 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
         .reduce(|(i, min), (j, e)| if e < min { (j, e) } else { (i, min) })
     {
         eprint!(
-            "\r{iter_num}, {} remaining, {} entropy",
+            "\r{iter_num}, {} remaining, {} entropy, {}us",
             entropy.iter().filter(|&e| *e != 0.0).count(),
-            entropy.iter().sum::<f32>()
+            entropy.iter().sum::<f32>(),
+            now.elapsed().as_micros()
         );
-        let mut rng = thread_rng();
+        spent.push(now.elapsed());
+        now = std::time::Instant::now();
         // COLLAPSE this cell into a random pattern based on the pattern distribution in the
         // source image
         let dist = WeightedIndex::new(patterns.frequencies(&wave[min_entropy_index])).unwrap();
@@ -351,17 +356,12 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
             // the set of patterns this cell could be as a result of the collapse.
             let (cell, post_collapse) = queue.pop().unwrap();
             assert!(!post_collapse.is_empty());
-            // `pre_collapse` is the set of patterns this cell could be pre-collapse
-            let pre_collapse: HashSet<usize> = wave[cell]
-                .iter()
-                .enumerate()
-                .filter(|(_, &possible)| possible)
-                .map(|(i, _)| i)
-                .collect();
-            // `difference` is the patterns that are no longer possible
-            let mut difference = pre_collapse.difference(&post_collapse).peekable();
-            if difference.peek().is_some() {
-                difference.for_each(|&i| wave[cell][i] = false);
+
+            // Only propagate from this cell if this cell has fewer options
+            let prev = wave[cell].clone();
+            let count = wave[cell].len();
+            wave[cell] = wave[cell].intersection(&post_collapse).copied().collect();
+            if count != wave[cell].len() {
                 changed.insert(cell);
                 get_neighbors(cell, width, height)
                     .into_iter()
@@ -372,18 +372,20 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
                         // of this cell's possible patterns.
                         let compatibles = wave[cell]
                             .iter()
-                            .enumerate()
-                            .filter(|(_, &possible)| possible)
-                            .map(|(i, _)| patterns.compatibles(i, &direction))
+                            .map(|&i| patterns.compatibles(i, &direction))
                             .reduce(|a, b| {
                                 let mut a = a;
                                 a.extend(b);
                                 a
                             })
-                            .expect("Unnexpected lack of possibilities");
+                            .expect(&format!(
+                                "Unnexpected lack of possibilities for {:?} of {:?}",
+                                direction, wave[cell]
+                            ));
                         queue.push((neighbor.unwrap(), compatibles));
                     });
             }
+            assert!(!wave[cell].is_empty());
         }
 
         // UPDATE ENTROPIES of changed cells
@@ -392,11 +394,16 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
             .for_each(|&cell| entropy[cell] = calculate_entropy(&wave[cell], &patterns));
 
         // Draw this frame
-        let image = draw(&wave, &patterns, width as usize, height as usize, 10);
-        let mut frame = image::Frame::new(image);
-        encoder.encode_frame(frame);
+        if iter_num % 1000 == 0 {
+            let image = draw(&wave, &patterns, width as usize, height as usize, 10);
+            let frame = image::Frame::new(image);
+            encoder.encode_frame(frame).unwrap();
+        }
         iter_num += 1;
     }
+
+    let avg = (spent.iter().sum::<std::time::Duration>() / iter_num as u32).as_micros();
+    println!("avg loop time: {}us", avg);
 
     // Save the final image
     let image = draw(&wave, &patterns, width as usize, height as usize, 10);
@@ -411,14 +418,14 @@ fn put_pixel_scaled(image: &mut Image, scale: u32, x: u32, y: u32, color: Rgb<u8
     }
 }
 
-fn get_average_color(mask: &Vec<bool>, patterns: &Patterns) -> Rgb<u8> {
+fn get_average_color(mask: &HashSet<usize>, patterns: &Patterns) -> image::Rgba<u8> {
     let frequencies: Vec<f32> = patterns
         .frequencies(mask)
         .into_iter()
         .map(|f| f as f32)
         .collect();
     let total: f32 = frequencies.iter().sum();
-    Rgb(frequencies
+    let rgb = Rgb(frequencies
         .iter()
         .enumerate()
         .map(|(pattern, freq)| {
@@ -430,10 +437,12 @@ fn get_average_color(mask: &Vec<bool>, patterns: &Patterns) -> Rgb<u8> {
         .reduce(|a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]])
         .unwrap()
         .map(|c| c as u8))
+    .0;
+    image::Rgba([rgb[0], rgb[1], rgb[2], 255])
 }
 
 fn draw(
-    wave: &Vec<Vec<bool>>,
+    wave: &Vec<HashSet<usize>>,
     patterns: &Patterns,
     width: usize,
     height: usize,
@@ -442,20 +451,8 @@ fn draw(
     let mut image = image::RgbaImage::new((width * scale) as u32, (height * scale) as u32);
     (0..width).for_each(|x| {
         (0..height).for_each(|y| {
-            let possibilities: Vec<usize> = wave[(x + width * y) as usize]
-                .iter()
-                .enumerate()
-                .filter(|(_, &possible)| possible)
-                .map(|(i, _)| i)
-                .collect();
-            let color = if possibilities.len() == 1 {
-                let pattern = possibilities[0];
-                patterns.top_left_color(pattern)
-            } else {
-                get_average_color(&wave[(x + width * y) as usize], &patterns)
-            }
-            .0;
-            let color = image::Rgba([color[0], color[1], color[2], 255]);
+            let possibilities = &wave[(x + width * y) as usize];
+            let color = get_average_color(possibilities, &patterns);
             (0..scale).for_each(|dx| {
                 (0..scale).for_each(|dy| {
                     image.put_pixel((scale * x + dx) as u32, (scale * y + dy) as u32, color);
