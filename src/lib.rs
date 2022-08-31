@@ -175,14 +175,6 @@ impl Patterns {
         self.patterns.len()
     }
 
-    pub fn probability_of(&self, pattern: usize) -> f32 {
-        self.info.get(&pattern).unwrap().0 as f32 / self.len() as f32
-    }
-
-    fn get_pattern_occurances(&self, pattern: usize) -> u32 {
-        self.info.get(&pattern).unwrap().0
-    }
-
     fn frequencies(&self, mask: &HashSet<usize>) -> Vec<u32> {
         (0..self.len())
             .map(|i| {
@@ -300,114 +292,259 @@ fn get_neighbors(cell: usize, width: u32, height: u32) -> [Option<usize>; 4] {
     }
 }
 
-pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height: u32) {
-    // Output gif setup
-    let mut file = File::create("data/output.gif").unwrap();
-    let mut encoder = image::codecs::gif::GifEncoder::new(file);
-    encoder
-        .set_repeat(image::codecs::gif::Repeat::Infinite)
-        .unwrap();
+type Wave = Vec<HashSet<PatternId>>;
 
+fn initialize(
+    image: &Image,
+    n: u32,
+    m: u32,
+    width: u32,
+    height: u32,
+) -> (Patterns, Wave, Vec<f32>) {
     println!("Finding patterns");
     let patterns = find_patterns(image, n, m);
 
     println!("Creating wave");
     let all_patterns: HashSet<usize> = (0..patterns.len()).collect();
-    let mut wave: Vec<HashSet<usize>> = (0..(width * height))
+    let wave: Vec<HashSet<usize>> = (0..(width * height))
         .map(|_| HashSet::from(all_patterns.clone()))
         .collect();
     println!("freqs: {:?}", patterns.frequencies(&wave[0]));
     println!("Calculating entropies");
-    let mut entropy: Vec<f32> = wave
+    let entropy: Vec<f32> = wave
         .iter()
         .map(|mask| calculate_entropy(mask, &patterns))
         .collect();
 
-    // maybe just use reduce instead of min
-    let mut iter_num = 0;
-    let mut now = std::time::Instant::now();
-    let mut spent = vec![];
-    let mut rng = thread_rng();
-    while let Some((min_entropy_index, _)) = entropy
+    (patterns, wave, entropy)
+}
+
+fn observe(wave: &Wave, entropy: &Vec<f32>, patterns: &Patterns) -> Option<(usize, PatternId)> {
+    // Get the cell with the least nonzero entropy
+    if let Some((cell, _)) = entropy
         .iter()
         .enumerate()
         .filter(|&(_, e)| *e != 0.0)
         .reduce(|(i, min), (j, e)| if e < min { (j, e) } else { (i, min) })
     {
-        eprint!(
-            "\r{iter_num}, {} remaining, {} entropy, {}us",
-            entropy.iter().filter(|&e| *e != 0.0).count(),
-            entropy.iter().sum::<f32>(),
-            now.elapsed().as_micros()
-        );
-        spent.push(now.elapsed());
-        now = std::time::Instant::now();
-        // COLLAPSE this cell into a random pattern based on the pattern distribution in the
-        // source image
-        let dist = WeightedIndex::new(patterns.frequencies(&wave[min_entropy_index])).unwrap();
+        // Randomly pick a pattern from the cell's possible patterns, weighted by times that
+        // pattern occurred in the seed
+        let dist = WeightedIndex::new(patterns.frequencies(&wave[cell])).unwrap();
+        let mut rng = thread_rng();
         let pattern = dist.sample(&mut rng);
+        Some((cell, pattern))
+    } else {
+        None
+    }
+}
 
-        // PROPAGATE this collapse through neighbors
-        let mut queue: Vec<(usize, HashSet<usize>)> = vec![(min_entropy_index, [pattern].into())];
-        let mut changed: HashSet<usize> = HashSet::new();
+enum PropagationResult {
+    Success(HashMap<usize, HashSet<PatternId>>),
+    Contradiction,
+}
 
-        while !queue.is_empty() {
-            // `cell` is the cell we're propagating the collapse through, and `post_collapse` is
-            // the set of patterns this cell could be as a result of the collapse.
-            let (cell, post_collapse) = queue.pop().unwrap();
-            assert!(!post_collapse.is_empty());
+fn propagate(
+    collapses: Vec<(usize, PatternId)>,
+    wave: &Wave,
+    patterns: &Patterns,
+    width: u32,
+    height: u32,
+) -> PropagationResult {
+    //let (cell, pattern) = collapse;
+    let mut wave = wave.clone();
+    // Starting with the collapsed cell, propagating changes
+    let mut queue: Vec<(usize, HashSet<PatternId>)> = collapses
+        .into_iter()
+        .map(|(cell, pattern)| {
+            let pattern: HashSet<PatternId> = [pattern].into_iter().collect();
+            (cell, pattern)
+        })
+        .collect();
+    // Keep track of changed cells to know which to recalculate entropy for
+    let mut changes: HashMap<usize, HashSet<PatternId>> = HashMap::new();
 
-            // Only propagate from this cell if this cell has fewer options
-            let prev = wave[cell].clone();
-            let count = wave[cell].len();
-            wave[cell] = wave[cell].intersection(&post_collapse).copied().collect();
-            if count != wave[cell].len() {
-                changed.insert(cell);
-                get_neighbors(cell, width, height)
-                    .into_iter()
-                    .zip(DIRECTIONS.into_iter())
-                    .filter(|(neighbor, _)| neighbor.is_some())
-                    .for_each(|(neighbor, direction)| {
-                        // Compatibles is the set of all patterns that can be to `direction` of any
-                        // of this cell's possible patterns.
-                        let compatibles = wave[cell]
-                            .iter()
-                            .map(|&i| patterns.compatibles(i, &direction))
-                            .reduce(|a, b| {
-                                let mut a = a;
-                                a.extend(b);
-                                a
-                            })
-                            .expect(&format!(
-                                "Unnexpected lack of possibilities for {:?} of {:?}",
-                                direction, wave[cell]
-                            ));
-                        queue.push((neighbor.unwrap(), compatibles));
-                    });
-            }
-            assert!(!wave[cell].is_empty());
+    while !queue.is_empty() {
+        // `cell` is the cell we're propagating the collapse through, and `post_collapse` is
+        // the set of patterns this cell could be as a result of the collapse.
+        let (cell, post_collapse) = queue.pop().unwrap();
+        assert!(!post_collapse.is_empty());
+
+        // Only propagate from this cell if this cell has fewer options
+        let prev = wave[cell].len();
+        wave[cell] = wave[cell].intersection(&post_collapse).copied().collect();
+
+        // If this cell has no possibilities, the algorithm has run into a contradiction
+        if wave[cell].is_empty() {
+            println!("\n contradiction with {cell}");
+            return PropagationResult::Contradiction;
         }
 
-        // UPDATE ENTROPIES of changed cells
-        changed
-            .iter()
-            .for_each(|&cell| entropy[cell] = calculate_entropy(&wave[cell], &patterns));
-
-        // Draw this frame
-        if iter_num % 1000 == 0 {
-            let image = draw(&wave, &patterns, width as usize, height as usize, 10);
-            let frame = image::Frame::new(image);
-            encoder.encode_frame(frame).unwrap();
+        if prev != wave[cell].len() {
+            // Insert (overwrite, even) these changes
+            changes.insert(cell, wave[cell].clone());
+            // Propagate changes to neighbors
+            get_neighbors(cell, width, height)
+                .into_iter()
+                .zip(DIRECTIONS.into_iter())
+                .filter(|(neighbor, _)| neighbor.is_some())
+                .for_each(|(neighbor, direction)| {
+                    // Compatibles is the set of all patterns that can be to `direction` of any
+                    // of this cell's possible patterns.
+                    let compatibles = wave[cell]
+                        .iter()
+                        .map(|&i| patterns.compatibles(i, &direction))
+                        .reduce(|a, b| {
+                            let mut a = a;
+                            a.extend(b);
+                            a
+                        })
+                        .expect(&format!(
+                            "Unnexpected lack of possibilities for {:?} of {:?}",
+                            direction, wave[cell]
+                        ));
+                    queue.push((neighbor.unwrap(), compatibles));
+                });
         }
-        iter_num += 1;
     }
 
-    let avg = (spent.iter().sum::<std::time::Duration>() / iter_num as u32).as_micros();
-    println!("avg loop time: {}us", avg);
+    PropagationResult::Success(changes)
+}
+
+type Collapse = (usize, PatternId);
+type PatternSet = HashSet<PatternId>;
+type CollapseHistory = Vec<(Collapse, HashMap<usize, PatternSet>)>;
+
+fn unwind_history(
+    bad_collapse: Collapse,
+    mut history: CollapseHistory,
+    mut wave: Wave,
+    mut entropy: Vec<f32>,
+    patterns: &Patterns,
+) -> (Option<Collapse>, Wave, Vec<f32>, CollapseHistory) {
+    // Get the part of the wave associated with the bad collapse and ban the pattern that caused
+    // the bad collapse. bad_wave must be grabbed here, so that previous bans are not erased.
+    let mut bad_wave = wave[bad_collapse.0].clone();
+    assert!(bad_wave.remove(&bad_collapse.1));
+
+    // Pop off the bad collapse
+    let (collapse, wave_diff) = history
+        .pop()
+        .expect("Backtracked all the way to the beginning");
+
+    // Rebuild the rest of the wave from its history
+    wave_diff.keys().for_each(|cell| {
+        // Search the history for the last specified pattern set for this cell, otherwise this is
+        // the first time it was modified so before it was all paterns.
+        let last_known: PatternSet = history
+            .iter()
+            .find_map(|(_, diff)| diff.get(cell))
+            .and_then(|last_known| Some(last_known.clone()))
+            .unwrap_or((0..patterns.len()).collect());
+        wave[*cell] = last_known;
+        entropy[*cell] = calculate_entropy(&wave[*cell], &patterns)
+    });
+
+    // However, it is possible that the contradiction didn't originate with this collapse, and only
+    // presented itself here, i.e. it is possible that bad_wave is now empty. If so, go back once
+    // more.
+    if bad_wave.is_empty() {
+        println!("Going further back!");
+        return unwind_history(collapse, history, wave, entropy, patterns);
+    }
+
+    // Patch the wave to include the bans
+    wave[bad_collapse.0] = bad_wave;
+    entropy[bad_collapse.0] = calculate_entropy(&wave[bad_collapse.0], &patterns);
+
+    (Some(collapse), wave, entropy, history)
+}
+
+pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height: u32) {
+    // Number of digits to display the number of cells
+    let rem_width = format!("{}", width * height).len();
+    // Output gif setup
+    let file = File::create("data/output.gif").unwrap();
+    let mut encoder = image::codecs::gif::GifEncoder::new(file);
+    encoder
+        .set_repeat(image::codecs::gif::Repeat::Infinite)
+        .unwrap();
+
+    let (patterns, mut wave, mut entropy) = initialize(image, n, m, width, height);
+
+    // Observation stack
+    let mut history: CollapseHistory = Vec::new();
+    let mut bad_collapse = None;
+    // Overserve-propagate-update loop
+    let mut iter_num: usize = 0;
+    loop {
+        iter_num += 1;
+        // Observe and collapse a new cell or break if there are no unobserved cells
+        let collapse: Collapse = match observe(&wave, &entropy, &patterns) {
+            Some((c, p)) => (c, p),
+            None => break,
+        };
+        // If this collapse previously led to a contradiction, backtrack
+        if bad_collapse == Some(collapse) {
+            println!(
+                "Backtracking on observation with {} collapsing to {}",
+                collapse.0, collapse.1
+            );
+            // Undo last observation
+            (bad_collapse, wave, entropy, history) =
+                unwind_history(collapse, history, wave, entropy, &patterns);
+            // Observe again
+            continue;
+        }
+        println!("1 {:?}: {}", collapse, {
+            if wave[collapse.0].len() == patterns.len() {
+                format!("all")
+            } else {
+                format!("{:?}", wave[collapse.0])
+            }
+        });
+
+        // Logging
+        let remaining = entropy.iter().filter(|&e| *e != 0.0).count() as u32;
+        let backtracks = iter_num - history.len() - 1;
+        let percent = 100.0 * ((width * height) - remaining) as f32 / (width * height) as f32;
+        println!(
+            "\r{}: {} obs, {} backtracks, {:>rem_width$} rem, {:2.0}%",
+            iter_num,
+            history.len(),
+            backtracks,
+            remaining,
+            percent
+        );
+
+        // Propagate this collapse
+        match propagate(vec![collapse], &wave, &patterns, width, height) {
+            // Update entropies
+            PropagationResult::Success(changes) => {
+                history.push((collapse, changes.clone()));
+                changes.into_iter().for_each(|(cell, mask)| {
+                    wave[cell] = mask;
+                    entropy[cell] = calculate_entropy(&wave[cell], &patterns)
+                });
+            }
+            // Backtrack
+            PropagationResult::Contradiction => {
+                println!(
+                    "Backtracking on contradiction with {} collapsing to {}...",
+                    collapse.0, collapse.1
+                );
+                // Undo last observation
+                (bad_collapse, wave, entropy, history) =
+                    unwind_history(collapse, history, wave, entropy, &patterns);
+                // Observe again
+                continue;
+            }
+        }
+    }
+    println!("out of loop");
 
     // Save the final image
     let image = draw(&wave, &patterns, width as usize, height as usize, 10);
-    image.save("data/output.png");
+    image.save("data/output.png").expect("Unable to save image");
 }
 
 fn put_pixel_scaled(image: &mut Image, scale: u32, x: u32, y: u32, color: Rgb<u8>) {
