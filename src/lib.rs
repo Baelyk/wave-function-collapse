@@ -1,5 +1,10 @@
+use image::codecs::gif::GifEncoder;
 use image::io::Reader as ImageReader;
+use image::Frame;
+use image::ImageResult;
 use image::Rgb;
+use image::Rgba;
+use image::RgbaImage;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::collections::hash_map::DefaultHasher;
@@ -344,22 +349,16 @@ enum PropagationResult {
 }
 
 fn propagate(
-    collapses: Vec<(usize, PatternId)>,
+    collapse: Collapse,
     wave: &Wave,
     patterns: &Patterns,
     width: u32,
     height: u32,
 ) -> PropagationResult {
-    //let (cell, pattern) = collapse;
+    let (cell, pattern) = collapse;
     let mut wave = wave.clone();
     // Starting with the collapsed cell, propagating changes
-    let mut queue: Vec<(usize, HashSet<PatternId>)> = collapses
-        .into_iter()
-        .map(|(cell, pattern)| {
-            let pattern: HashSet<PatternId> = [pattern].into_iter().collect();
-            (cell, pattern)
-        })
-        .collect();
+    let mut queue: Vec<(usize, HashSet<PatternId>)> = vec![(cell, [pattern].into())];
     // Keep track of changed cells to know which to recalculate entropy for
     let mut changes: HashMap<usize, HashSet<PatternId>> = HashMap::new();
 
@@ -414,66 +413,14 @@ type Collapse = (usize, PatternId);
 type PatternSet = HashSet<PatternId>;
 type CollapseHistory = Vec<(Collapse, HashMap<usize, PatternSet>)>;
 
-fn unwind_history(
-    bad_collapse: Collapse,
-    mut history: CollapseHistory,
-    mut wave: Wave,
-    mut entropy: Vec<f32>,
-    patterns: &Patterns,
-) -> (Option<Collapse>, Wave, Vec<f32>, CollapseHistory) {
-    // Get the part of the wave associated with the bad collapse and ban the pattern that caused
-    // the bad collapse. bad_wave must be grabbed here, so that previous bans are not erased.
-    let mut bad_wave = wave[bad_collapse.0].clone();
-    assert!(bad_wave.remove(&bad_collapse.1));
-
-    // Pop off the bad collapse
-    let (collapse, wave_diff) = history
-        .pop()
-        .expect("Backtracked all the way to the beginning");
-
-    // Rebuild the rest of the wave from its history
-    wave_diff.keys().for_each(|cell| {
-        // Search the history for the last specified pattern set for this cell, otherwise this is
-        // the first time it was modified so before it was all paterns.
-        let last_known: PatternSet = history
-            .iter()
-            .find_map(|(_, diff)| diff.get(cell))
-            .and_then(|last_known| Some(last_known.clone()))
-            .unwrap_or((0..patterns.len()).collect());
-        wave[*cell] = last_known;
-        entropy[*cell] = calculate_entropy(&wave[*cell], &patterns)
-    });
-
-    // However, it is possible that the contradiction didn't originate with this collapse, and only
-    // presented itself here, i.e. it is possible that bad_wave is now empty. If so, go back once
-    // more.
-    if bad_wave.is_empty() {
-        println!("Going further back!");
-        return unwind_history(collapse, history, wave, entropy, patterns);
-    }
-
-    // Patch the wave to include the bans
-    wave[bad_collapse.0] = bad_wave;
-    entropy[bad_collapse.0] = calculate_entropy(&wave[bad_collapse.0], &patterns);
-
-    (Some(collapse), wave, entropy, history)
-}
-
 pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height: u32) {
     // Number of digits to display the number of cells
     let rem_width = format!("{}", width * height).len();
-    // Output gif setup
-    let file = File::create("data/output.gif").unwrap();
-    let mut encoder = image::codecs::gif::GifEncoder::new(file);
-    encoder
-        .set_repeat(image::codecs::gif::Repeat::Infinite)
-        .unwrap();
 
-    let (patterns, mut wave, mut entropy) = initialize(image, n, m, width, height);
-
+    let (mut patterns, mut wave, mut entropy) = initialize(image, n, m, width, height);
+    let mut restarts = 0;
     // Observation stack
     let mut history: CollapseHistory = Vec::new();
-    let mut bad_collapse = None;
     // Overserve-propagate-update loop
     let mut iter_num: usize = 0;
     loop {
@@ -483,41 +430,21 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
             Some((c, p)) => (c, p),
             None => break,
         };
-        // If this collapse previously led to a contradiction, backtrack
-        if bad_collapse == Some(collapse) {
-            println!(
-                "Backtracking on observation with {} collapsing to {}",
-                collapse.0, collapse.1
-            );
-            // Undo last observation
-            (bad_collapse, wave, entropy, history) =
-                unwind_history(collapse, history, wave, entropy, &patterns);
-            // Observe again
-            continue;
-        }
-        println!("1 {:?}: {}", collapse, {
-            if wave[collapse.0].len() == patterns.len() {
-                format!("all")
-            } else {
-                format!("{:?}", wave[collapse.0])
-            }
-        });
 
         // Logging
         let remaining = entropy.iter().filter(|&e| *e != 0.0).count() as u32;
-        let backtracks = iter_num - history.len() - 1;
         let percent = 100.0 * ((width * height) - remaining) as f32 / (width * height) as f32;
-        println!(
-            "\r{}: {} obs, {} backtracks, {:>rem_width$} rem, {:2.0}%",
+        eprint!(
+            "\r{}: {} obs, {} restarts, {:>rem_width$} rem, {:2.0}%",
             iter_num,
             history.len(),
-            backtracks,
+            restarts,
             remaining,
             percent
         );
 
         // Propagate this collapse
-        match propagate(vec![collapse], &wave, &patterns, width, height) {
+        match propagate(collapse, &wave, &patterns, width, height) {
             // Update entropies
             PropagationResult::Success(changes) => {
                 history.push((collapse, changes.clone()));
@@ -526,28 +453,65 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
                     entropy[cell] = calculate_entropy(&wave[cell], &patterns)
                 });
             }
-            // Backtrack
+            // Restart
             PropagationResult::Contradiction => {
-                println!(
-                    "Backtracking on contradiction with {} collapsing to {}...",
-                    collapse.0, collapse.1
-                );
-                // Undo last observation
-                (bad_collapse, wave, entropy, history) =
-                    unwind_history(collapse, history, wave, entropy, &patterns);
+                eprintln!("\nRestarting...");
+                restarts += 1;
+                (patterns, wave, entropy) = initialize(image, n, m, width, height);
+                history.drain(1..);
+                iter_num = 0;
                 // Observe again
                 continue;
             }
         }
     }
-    println!("out of loop");
+    println!(
+        "\rFinished after {} restarts and {} iterations",
+        restarts,
+        iter_num - 1
+    );
 
-    // Save the final image
-    let image = draw(&wave, &patterns, width as usize, height as usize, 10);
-    image.save("data/output.png").expect("Unable to save image");
+    // Animate
+    animate(&history, &patterns, width, height, 10);
 }
 
-fn put_pixel_scaled(image: &mut Image, scale: u32, x: u32, y: u32, color: Rgb<u8>) {
+fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u32, scale: u32) {
+    let file = File::create("data/output.gif").unwrap();
+    let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(file, 30);
+    encoder
+        .set_repeat(image::codecs::gif::Repeat::Infinite)
+        .unwrap();
+    let format_width = format!("{}", history.len()).len();
+
+    // The first frame is the average of all the patterns
+    let all_patterns: HashSet<usize> = (0..patterns.len()).collect();
+    let background = get_average_color(&all_patterns, &patterns);
+    let mut frame = RgbaImage::new(width * scale, height * scale);
+    frame.pixels_mut().for_each(|pixel| *pixel = background);
+
+    // Create the next frame by copying the last and only modifying the changed cells
+    history.iter().enumerate().for_each(|(i, (_, diffs))| {
+        eprint!(
+            "\rAnimating {:format_width$}/{:format_width$}",
+            i,
+            history.len()
+        );
+        encoder
+            .encode_frame(Frame::new(frame.clone()))
+            .expect("Error encoding frame");
+        diffs.iter().for_each(|(index, mask)| {
+            let index = *index as u32;
+            let (x, y) = (index % width, index / width);
+            let color = get_average_color(mask, patterns);
+            put_pixel_scaled(&mut frame, scale, x, y, color)
+        });
+    });
+
+    // Save the final image
+    frame.save("data/output.png").expect("Unable to save image");
+}
+
+fn put_pixel_scaled(image: &mut RgbaImage, scale: u32, x: u32, y: u32, color: Rgba<u8>) {
     for dx in 0..scale {
         for dy in 0..scale {
             image.put_pixel(scale * x + dx, scale * y + dy, color);
@@ -609,37 +573,5 @@ mod tests {
     fn it_works() {
         let result = add(2, 2);
         assert_eq!(result, 4);
-    }
-
-    #[test]
-    fn test_neighbors() {
-        let width = 50;
-        let height = 50;
-        let scale = 10;
-        let mut image = image::RgbImage::new((width * scale) as u32, (height * scale) as u32);
-        let cell = 280;
-        let neighbors = get_neighbors(cell, width, height);
-        //assert_eq!(neighbors, [Some(2475), Some(24), Some(75), Some(26)]);
-        put_pixel_scaled(
-            &mut image,
-            scale,
-            cell as u32 % width,
-            cell as u32 / width,
-            Rgb([255, 0, 0]),
-        );
-        neighbors
-            .iter()
-            .zip([(100, 100), (0, 255), (255, 0), (255, 255)])
-            .for_each(|(cell, (g, b))| {
-                let cell = cell.unwrap() as u32;
-                put_pixel_scaled(
-                    &mut image,
-                    scale,
-                    cell as u32 % width,
-                    cell as u32 / width,
-                    Rgb([0, g, b]),
-                );
-            });
-        image.save("data/test_neighbors.png").unwrap();
     }
 }
