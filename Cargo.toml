@@ -8,4 +8,5 @@ autobins = true
 
 [dependencies]
 image = "0.24.3"
+webp-animation = "0.7.0"
 rand = { version = "0.8.5", features = ["alloc"] }

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
+use webp_animation::Encoder;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right
@@ -473,53 +474,87 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
 
     // Animate
     animate(&history, &patterns, width, height, 10);
+    let mut image = draw(&wave, &patterns, width as usize, height as usize, 10);
+    image.save("data/output.png");
 }
 
 fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u32, scale: u32) {
     let file = File::create("data/output.gif").unwrap();
-    let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(file, 30);
-    encoder
-        .set_repeat(image::codecs::gif::Repeat::Infinite)
+    let mut gif = GifEncoder::new_with_speed(file, 10);
+    gif.set_repeat(image::codecs::gif::Repeat::Infinite)
         .unwrap();
+    let mut encoder = Encoder::new((scale * width, scale * height)).unwrap();
     let format_width = format!("{}", history.len()).len();
 
     // The first frame is the average of all the patterns
     let all_patterns: HashSet<usize> = (0..patterns.len()).collect();
     let background = get_average_color(&all_patterns, &patterns);
-    let mut frame = RgbaImage::new(width * scale, height * scale);
-    frame.pixels_mut().for_each(|pixel| *pixel = background);
+    let mut frame = background.repeat((scale * width * scale * height) as usize);
 
+    let duration = 5;
+    let delay = std::cmp::max(20, (duration * 1000) / history.len() as i32);
+    let skip_by = std::cmp::max(1, history.len() as i32 / (duration * (1000 / delay))) as usize;
+    println!("{} {} {}", delay, 1000.0 / delay as f32, skip_by);
     // Create the next frame by copying the last and only modifying the changed cells
     history.iter().enumerate().for_each(|(i, (_, diffs))| {
         eprint!(
             "\rAnimating {:format_width$}/{:format_width$}",
-            i,
+            i + 1,
             history.len()
         );
-        encoder
-            .encode_frame(Frame::new(frame.clone()))
-            .expect("Error encoding frame");
+        if i % skip_by == 0 {
+            eprint!("rending {i}");
+            encoder
+                .add_frame(&frame, (i / skip_by) as i32 * delay)
+                .unwrap();
+            let gif_frame = Frame::from_parts(
+                RgbaImage::from_vec(scale * width, scale * height, frame.clone()).unwrap(),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(delay as u32, 1),
+            );
+            gif.encode_frame(gif_frame).unwrap();
+        }
         diffs.iter().for_each(|(index, mask)| {
             let index = *index as u32;
             let (x, y) = (index % width, index / width);
             let color = get_average_color(mask, patterns);
-            put_pixel_scaled(&mut frame, scale, x, y, color)
+            put_pixel_scaled(&mut frame, scale, width, x, y, color)
         });
     });
+    encoder
+        .add_frame(&frame, (history.len() / skip_by + 1) as i32 * delay)
+        .unwrap();
+    let gif_frame = Frame::from_parts(
+        RgbaImage::from_vec(scale * width, scale * height, frame.clone()).unwrap(),
+        0,
+        0,
+        image::Delay::from_numer_denom_ms(((history.len() / skip_by + 1) as i32 * delay) as u32, 1),
+    );
+    gif.encode_frame(gif_frame.clone()).unwrap();
+    println!("delay: {:?}", gif_frame.delay());
 
-    // Save the final image
-    frame.save("data/output.png").expect("Unable to save image");
+    let data = encoder
+        .finalize(1000 + ((history.len() / skip_by + 1) as i32 * delay))
+        .unwrap();
+    std::fs::write("data/output.webp", data).unwrap();
 }
 
-fn put_pixel_scaled(image: &mut RgbaImage, scale: u32, x: u32, y: u32, color: Rgba<u8>) {
+fn put_pixel_scaled(data: &mut [u8], scale: u32, width: u32, x: u32, y: u32, color: [u8; 4]) {
     for dx in 0..scale {
         for dy in 0..scale {
-            image.put_pixel(scale * x + dx, scale * y + dy, color);
+            let (x, y) = (scale * x + dx, scale * y + dy);
+            // 4 channels, there are scale * width pixels in a row
+            let index = 4 * (x + y * scale * width) as usize;
+            data[index..index + 4]
+                .iter_mut()
+                .zip(color.iter())
+                .for_each(|(data, channel)| *data = *channel);
         }
     }
 }
 
-fn get_average_color(mask: &HashSet<usize>, patterns: &Patterns) -> image::Rgba<u8> {
+fn get_average_color(mask: &HashSet<usize>, patterns: &Patterns) -> [u8; 4] {
     let frequencies: Vec<f32> = patterns
         .frequencies(mask)
         .into_iter()
@@ -539,7 +574,7 @@ fn get_average_color(mask: &HashSet<usize>, patterns: &Patterns) -> image::Rgba<
         .unwrap()
         .map(|c| c as u8))
     .0;
-    image::Rgba([rgb[0], rgb[1], rgb[2], 255])
+    [rgb[0], rgb[1], rgb[2], 255]
 }
 
 fn draw(
@@ -556,7 +591,11 @@ fn draw(
             let color = get_average_color(possibilities, &patterns);
             (0..scale).for_each(|dx| {
                 (0..scale).for_each(|dy| {
-                    image.put_pixel((scale * x + dx) as u32, (scale * y + dy) as u32, color);
+                    image.put_pixel(
+                        (scale * x + dx) as u32,
+                        (scale * y + dy) as u32,
+                        Rgba(color),
+                    );
                 })
             })
         })
