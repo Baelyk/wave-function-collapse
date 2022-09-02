@@ -5,10 +5,107 @@ use image::RgbaImage;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
-use rustc_hash::FxHashSet as HashSet;
 use std::fs::File;
 use std::hash::Hash;
 use webp_animation::Encoder;
+
+/// A set of `usize`s to act as a pattern set
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Set(Vec<bool>);
+
+impl Set {
+    fn with_size(size: usize) -> Self {
+        Set(vec![false; size])
+    }
+
+    fn with_all(size: usize) -> Self {
+        Set(vec![true; size])
+    }
+
+    fn with_only(n: usize, size: usize) -> Self {
+        let mut set = Self::with_size(size);
+        set[n] = true;
+        set
+    }
+
+    fn contains(&self, n: usize) -> bool {
+        self[n]
+    }
+
+    fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+
+    fn iter<'a>(&'a self) -> impl Iterator<Item = usize> + 'a {
+        self.0
+            .iter()
+            .enumerate()
+            .filter(|(_, &included)| included)
+            .map(|(i, _)| i)
+    }
+}
+
+impl std::ops::Index<usize> for Set {
+    type Output = bool;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Set {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.0[index]
+    }
+}
+
+impl std::ops::BitAnd<&Set> for &Set {
+    type Output = Set;
+
+    fn bitand(self, rhs: &Set) -> Self::Output {
+        assert!(self.0.len() == rhs.0.len());
+        self.0
+            .iter()
+            .zip(rhs.0.iter())
+            .map(|(l, r)| *l && *r)
+            .collect()
+    }
+}
+
+impl std::ops::BitOr<&Set> for &Set {
+    type Output = Set;
+
+    fn bitor(self, rhs: &Set) -> Self::Output {
+        assert!(self.0.len() == rhs.0.len());
+        self.0
+            .iter()
+            .zip(rhs.0.iter())
+            .map(|(l, r)| *l || *r)
+            .collect()
+    }
+}
+impl std::fmt::Display for Set {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let contents = self.iter().enumerate().fold(String::new(), |acc, (i, n)| {
+            if i == 0 {
+                format!("{n}")
+            } else {
+                format!("{acc}, {n}")
+            }
+        });
+        write!(f, "{{{}}}", contents)
+    }
+}
+
+impl FromIterator<bool> for Set {
+    fn from_iter<I: IntoIterator<Item = bool>>(iter: I) -> Self {
+        Set(iter.into_iter().collect())
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Direction {
@@ -128,7 +225,7 @@ impl PatternInfo {
 }
 
 type PatternId = usize;
-type PatternSet = HashSet<PatternId>;
+type PatternSet = Set;
 struct Patterns(Vec<PatternInfo>);
 
 impl Patterns {
@@ -174,8 +271,7 @@ impl Patterns {
                     // Patterns than can be to the `direction` of this pattern
                     patterns
                         .iter()
-                        .enumerate()
-                        .filter(|&(_, (other, _))| {
+                        .map(|(other, _)| {
                             overlap
                                 == other.overlap(
                                     &direction.opposite(),
@@ -183,7 +279,6 @@ impl Patterns {
                                     pattern_height,
                                 )
                         })
-                        .map(|(j, _)| j)
                         .collect()
                 });
                 PatternInfo(pixel, *count, adjacency)
@@ -191,6 +286,18 @@ impl Patterns {
             .collect();
 
         Patterns(info)
+    }
+
+    fn set(&self) -> PatternSet {
+        Set::with_size(self.len())
+    }
+
+    fn set_all(&self) -> PatternSet {
+        Set::with_all(self.len())
+    }
+
+    fn set_with(&self, pattern: PatternId) -> PatternSet {
+        Set::with_only(pattern, self.len())
     }
 
     fn len(&self) -> usize {
@@ -203,11 +310,11 @@ impl Patterns {
         self.0
             .iter()
             .enumerate()
-            .map(|(i, info)| if mask.contains(&i) { info.count() } else { 0 })
+            .map(|(i, info)| if mask.contains(i) { info.count() } else { 0 })
     }
 
     /// Get the patterns that can be to the `direction` of `pattern`
-    fn compatibles(&self, pattern: PatternId, direction: &Direction) -> &HashSet<usize> {
+    fn compatibles(&self, pattern: PatternId, direction: &Direction) -> &PatternSet {
         &self.0[pattern].adjacency()[direction.to_index()]
     }
 
@@ -286,7 +393,7 @@ fn get_neighbors(cell: usize, width: u32, height: u32) -> [Option<usize>; 4] {
     }
 }
 
-type Wave = Vec<HashSet<PatternId>>;
+type Wave = Vec<PatternSet>;
 
 fn initialize(
     image: &RgbaImage,
@@ -300,7 +407,7 @@ fn initialize(
     eprintln!("Found {} patterns", patterns.len());
 
     // Initialize the wave so each cell is in a superposition of all patterns
-    let all_patterns: PatternSet = (0..patterns.len()).collect();
+    let all_patterns = patterns.set_all();
     let wave: Vec<PatternSet> = (0..(width * height))
         .map(|_| all_patterns.clone())
         .collect();
@@ -333,7 +440,7 @@ fn observe(wave: &Wave, entropy: &[f32], patterns: &Patterns) -> Option<Collapse
 }
 
 enum PropagationResult {
-    Success(HashMap<usize, HashSet<PatternId>>),
+    Success(HashMap<usize, PatternSet>),
     Contradiction,
 }
 
@@ -345,12 +452,10 @@ fn propagate(
     height: u32,
 ) -> PropagationResult {
     let (cell, pattern) = collapse;
-    let mut p = HashSet::default();
-    p.insert(pattern);
     // Starting with the collapsed cell, propagating changes
-    let mut queue: Vec<(usize, HashSet<PatternId>)> = vec![(cell, p)];
+    let mut queue: Vec<(usize, PatternSet)> = vec![(cell, patterns.set_with(pattern))];
     // Keep track of changed cells to know which to recalculate entropy for
-    let mut changes: HashMap<usize, HashSet<PatternId>> = HashMap::default();
+    let mut changes: HashMap<usize, PatternSet> = HashMap::default();
 
     while !queue.is_empty() {
         // `cell` is the cell we're propagating the collapse through, and `post_collapse` is
@@ -360,7 +465,7 @@ fn propagate(
 
         // Only propagate from this cell if this cell has fewer options
         let prev = wave[cell].len();
-        wave[cell] = wave[cell].intersection(&post_collapse).copied().collect();
+        wave[cell] = &wave[cell] & &post_collapse; // wave[cell].intersection(&post_collapse).copied().collect();
 
         // If this cell has no possibilities, the algorithm has run into a contradiction
         if wave[cell].is_empty() {
@@ -381,13 +486,8 @@ fn propagate(
                     // of this cell's possible patterns.
                     let compatibles = wave[cell]
                         .iter()
-                        .map(|&i| patterns.compatibles(i, &direction).clone())
-                        .reduce(|a, b| {
-                            let mut a = a;
-                            a.extend(b);
-                            a
-                        })
-                        .unwrap();
+                        .map(|i| patterns.compatibles(i, &direction))
+                        .fold(patterns.set(), |a, b| &a | b);
                     queue.push((neighbor.unwrap(), compatibles));
                 });
         }
@@ -483,8 +583,7 @@ fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u
     let format_width = format!("{}", history.len()).len();
 
     // The first frame is the average of all the patterns
-    let all_patterns: HashSet<usize> = (0..patterns.len()).collect();
-    let background = get_average_color(&all_patterns, patterns);
+    let background = get_average_color(&patterns.set_all(), patterns);
     let mut frame = background.repeat((scale * width * scale * height) as usize);
 
     let duration = 5;
@@ -567,7 +666,7 @@ fn get_average_color(mask: &PatternSet, patterns: &Patterns) -> Pixel {
 }
 
 fn draw(
-    wave: &[HashSet<usize>],
+    wave: &[PatternSet],
     patterns: &Patterns,
     width: usize,
     height: usize,
