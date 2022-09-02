@@ -1,22 +1,14 @@
 use image::codecs::gif::GifEncoder;
-use image::io::Reader as ImageReader;
 use image::Frame;
-use image::ImageResult;
-use image::Rgb;
 use image::Rgba;
 use image::RgbaImage;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use webp_animation::Encoder;
-
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Direction {
@@ -36,22 +28,12 @@ impl Direction {
         }
     }
 
-    fn to_index(&self) -> usize {
+    fn to_index(self) -> usize {
         match self {
             Direction::Top => 0,
             Direction::Left => 1,
             Direction::Bottom => 2,
             Direction::Right => 3,
-        }
-    }
-
-    fn from_index(index: usize) -> Self {
-        match index {
-            0 => Direction::Top,
-            1 => Direction::Left,
-            2 => Direction::Bottom,
-            3 => Direction::Right,
-            _ => panic!("Invalid direction index {index}"),
         }
     }
 }
@@ -63,42 +45,44 @@ const DIRECTIONS: [Direction; 4] = [
     Direction::Right,
 ];
 
-type PatternId = usize;
-
-struct Counter<T: Eq + Hash> {
-    counter: HashMap<T, u32>,
-}
-
-impl<T: Eq + Hash> Counter<T> {
-    fn with_capacity(capacity: usize) -> Self {
-        Counter {
-            counter: HashMap::with_capacity(capacity),
-        }
-    }
-
-    fn insert(&mut self, element: T) {
-        self.counter
-            .entry(element)
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-    }
-
-    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, T, u32> {
-        self.counter.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.counter.len()
-    }
-
-    pub fn into_keys(self) -> std::collections::hash_map::IntoKeys<T, u32> {
-        self.counter.into_keys()
-    }
-}
-
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+struct Pixel([u8; 4]);
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct Pattern {
-    pixels: Vec<Rgb<u8>>,
+struct Pattern(Vec<Pixel>);
+
+impl std::ops::Index<usize> for Pixel {
+    type Output = u8;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl std::ops::Deref for Pixel {
+    type Target = [u8; 4];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl FromIterator<Pixel> for Pattern {
+    fn from_iter<I: IntoIterator<Item = Pixel>>(iter: I) -> Self {
+        let pixels = iter.into_iter().collect();
+        Pattern(pixels)
+    }
+}
+
+impl From<Pixel> for Rgba<u8> {
+    fn from(pixel: Pixel) -> Self {
+        Self::from(pixel.0)
+    }
+}
+
+impl From<Rgba<u8>> for Pixel {
+    fn from(rgba: Rgba<u8>) -> Self {
+        Self(rgba.0)
+    }
 }
 
 impl Pattern {
@@ -108,12 +92,15 @@ impl Pattern {
     ///
     /// Note that when comparing to determine adjacent relations, seeing which patterns
     /// can be e.g. right of 1 compares between the right of 1 and the left of the other patterns.
-    fn overlap(&self, direction: &Direction, width: usize, height: usize) -> Vec<Rgb<u8>> {
-        self.pixels
+    fn overlap(&self, direction: &Direction, width: u32, height: u32) -> Self {
+        let (width, height) = (width as usize, height as usize);
+        let length = self.0.len();
+        assert_eq!(length, width * height);
+        self.0
             .iter()
             .enumerate()
             .filter(|&(i, _)| match direction {
-                Direction::Top => i < self.pixels.len() - width,
+                Direction::Top => i < length - width,
                 Direction::Left => i % width != width - 1,
                 Direction::Bottom => i >= width,
                 Direction::Right => i % width != 0,
@@ -121,118 +108,119 @@ impl Pattern {
             .map(|(_, p)| *p)
             .collect()
     }
+}
 
-    fn render(&self, filename: String, width: usize, height: usize, scale: usize) {
-        let mut image = image::RgbImage::new((width * scale) as u32, (height * scale) as u32);
-        (0..width).for_each(|x| {
-            (0..height).for_each(|y| {
-                let color = self.pixels[x + width * y];
-                (0..scale).for_each(|dx| {
-                    (0..scale).for_each(|dy| {
-                        image.put_pixel((scale * x + dx) as u32, (scale * y + dy) as u32, color);
-                    })
-                })
-            })
-        });
-        image.save(filename).unwrap();
+/// The color of this pattern, the times this pattern occured, this patterns adjacency
+/// compatibilities
+struct PatternInfo(Pixel, u32, [PatternSet; DIRECTIONS.len()]);
+impl PatternInfo {
+    fn color(&self) -> Pixel {
+        self.0
+    }
+
+    fn count(&self) -> u32 {
+        self.1
+    }
+
+    fn adjacency(&self) -> &[PatternSet; DIRECTIONS.len()] {
+        &self.2
     }
 }
 
-struct Patterns {
-    patterns: Vec<Pattern>,
-    /// PatternNum -> (pattern_occurences, adjacency compatibilities)
-    info: HashMap<usize, (u32, [HashSet<usize>; 4])>,
-}
+type PatternId = usize;
+type PatternSet = HashSet<PatternId>;
+struct Patterns(Vec<PatternInfo>);
 
 impl Patterns {
-    fn new(patterns: Counter<Pattern>, width: usize, height: usize) -> Self {
-        let mut info = HashMap::with_capacity(patterns.len());
+    fn from_image(image: &RgbaImage, pattern_width: u32, pattern_height: u32) -> Self {
+        let (width, height) = image.dimensions();
 
-        // Find the others this pattern can overlap with
-        patterns
+        // Get the `pattern_width` by `pattern_height` patterns with top-left corner at (x, y),
+        // wrapping around the sides of the image.
+        let mut patterns = HashMap::default();
+        for x in 0..width {
+            for y in 0..height {
+                let mut pixels = Vec::with_capacity((pattern_width * pattern_height) as usize);
+                for dy in 0..pattern_height {
+                    for dx in 0..pattern_width {
+                        let pixel = *image.get_pixel((x + dx) % width, (y + dy) % height);
+                        pixels.push(pixel.into());
+                    }
+                }
+                // Count occurences of patterns as well
+                patterns
+                    .entry(Pattern(pixels))
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+            }
+        }
+
+        // TODO: Augment pattern data with rotations and reflections
+
+        // From here on, we no longer care about the source image
+
+        // Extract the relevant information from the patterns
+        // 1. The color of the top-left corner
+        // 2. The times this pattern occurred
+        // 3. Its adjacency compatibilities
+        let info = patterns
             .iter()
-            .enumerate()
-            .for_each(|(i, (pattern, count))| {
-                let overlapable = DIRECTIONS.map(|direction| {
-                    let overlap = pattern.overlap(&direction, width, height);
-                    // List of patterns than can be to the `direction` of this pattern
+            .map(|(pattern, count)| {
+                let pixel = pattern.0[0];
+                let adjacency = DIRECTIONS.map(|direction| {
+                    let overlap = pattern.overlap(&direction, pattern_width, pattern_height);
+                    // This relies on the HashMap iterating in the same order both times, which
+                    // works right now, but I do not believe is guaranteed to work.
+                    // Patterns than can be to the `direction` of this pattern
                     patterns
                         .iter()
                         .enumerate()
                         .filter(|&(_, (other, _))| {
-                            overlap == other.overlap(&direction.opposite(), width, height)
+                            overlap
+                                == other.overlap(
+                                    &direction.opposite(),
+                                    pattern_width,
+                                    pattern_height,
+                                )
                         })
                         .map(|(j, _)| j)
                         .collect()
                 });
-                info.insert(i, (*count, overlapable));
-            });
-
-        let patterns: Vec<Pattern> = patterns.into_keys().collect();
-
-        patterns.iter().enumerate().for_each(|(i, pattern)| {
-            pattern.render(format!("data/pattern_{i}.png"), width, height, 10)
-        });
-
-        Patterns { patterns, info }
-    }
-
-    pub fn len(&self) -> usize {
-        self.patterns.len()
-    }
-
-    fn frequencies(&self, mask: &HashSet<usize>) -> Vec<u32> {
-        (0..self.len())
-            .map(|i| {
-                if mask.contains(&i) {
-                    self.info.get(&i).unwrap().0
-                } else {
-                    0
-                }
+                PatternInfo(pixel, *count, adjacency)
             })
-            .collect()
+            .collect();
+
+        Patterns(info)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Get the number of times each pattern occured in the source image, where patterns not in the
+    /// mask are set to zero.
+    fn frequencies<'a>(&'a self, mask: &'a PatternSet) -> impl Iterator<Item = u32> + 'a {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(i, info)| if mask.contains(&i) { info.count() } else { 0 })
     }
 
     /// Get the patterns that can be to the `direction` of `pattern`
-    fn compatibles(&self, pattern: usize, direction: &Direction) -> HashSet<usize> {
-        self.info.get(&pattern).unwrap().1[direction.to_index()].clone()
+    fn compatibles(&self, pattern: PatternId, direction: &Direction) -> &HashSet<usize> {
+        &self.0[pattern].adjacency()[direction.to_index()]
     }
 
-    fn top_left_color(&self, pattern: usize) -> Rgb<u8> {
-        self.patterns[pattern].pixels[0]
+    /// Get the display color of this pattern, obtained from the top-left pixel.
+    fn color(&self, pattern: PatternId) -> Pixel {
+        self.0[pattern].color()
     }
 }
 
-type Image = image::RgbImage; // image::ImageBuffer<Rgb<u8>, Vec<u8>>;
-
-fn find_patterns(image: &Image, n: u32, m: u32) -> Patterns {
-    let (width, height) = image.dimensions();
-
-    // TODO: Augment pattern data with rotations and reflections
-    // Get the n by m patterns with top-left corner at (x, y), wrapping around the sides of the
-    // image.
-    let mut patterns = Counter::with_capacity((width * height) as usize);
-    for x in 0..width {
-        for y in 0..height {
-            let mut pixels = Vec::with_capacity((n * m) as usize);
-            for dy in 0..m {
-                for dx in 0..n {
-                    let pixel = image.get_pixel((x + dx) % width, (y + dy) % height);
-                    pixels.push(*pixel);
-                }
-            }
-            patterns.insert(Pattern { pixels });
-        }
-    }
-
-    Patterns::new(patterns, n as usize, m as usize)
-}
-
-fn calculate_entropy(mask: &HashSet<usize>, patterns: &Patterns) -> f32 {
+fn calculate_entropy(mask: &PatternSet, patterns: &Patterns) -> f32 {
     // Entropy is -sum(p_i * log(p_i)), p_i = occurences_of_i / all_occurences
     let frequencies: Vec<f32> = patterns
         .frequencies(mask)
-        .into_iter()
         .map(|f| f as f32)
         .filter(|f| *f != 0.0)
         .collect();
@@ -301,31 +289,30 @@ fn get_neighbors(cell: usize, width: u32, height: u32) -> [Option<usize>; 4] {
 type Wave = Vec<HashSet<PatternId>>;
 
 fn initialize(
-    image: &Image,
+    image: &RgbaImage,
     n: u32,
     m: u32,
     width: u32,
     height: u32,
 ) -> (Patterns, Wave, Vec<f32>) {
-    println!("Finding patterns");
-    let patterns = find_patterns(image, n, m);
+    // Find the patterns from the source image
+    let patterns = Patterns::from_image(image, n, m);
+    eprintln!("Found {} patterns", patterns.len());
 
-    println!("Creating wave");
-    let all_patterns: HashSet<usize> = (0..patterns.len()).collect();
-    let wave: Vec<HashSet<usize>> = (0..(width * height))
-        .map(|_| HashSet::from(all_patterns.clone()))
+    // Initialize the wave so each cell is in a superposition of all patterns
+    let all_patterns: PatternSet = (0..patterns.len()).collect();
+    let wave: Vec<PatternSet> = (0..(width * height))
+        .map(|_| all_patterns.clone())
         .collect();
-    println!("freqs: {:?}", patterns.frequencies(&wave[0]));
-    println!("Calculating entropies");
-    let entropy: Vec<f32> = wave
-        .iter()
-        .map(|mask| calculate_entropy(mask, &patterns))
-        .collect();
+
+    // Each cell has the same entropy at the start
+    let entropy = calculate_entropy(&all_patterns, &patterns);
+    let entropy = [entropy].repeat(wave.len());
 
     (patterns, wave, entropy)
 }
 
-fn observe(wave: &Wave, entropy: &Vec<f32>, patterns: &Patterns) -> Option<(usize, PatternId)> {
+fn observe(wave: &Wave, entropy: &[f32], patterns: &Patterns) -> Option<Collapse> {
     // Get the cell with the least nonzero entropy
     if let Some((cell, _)) = entropy
         .iter()
@@ -340,6 +327,7 @@ fn observe(wave: &Wave, entropy: &Vec<f32>, patterns: &Patterns) -> Option<(usiz
         let pattern = dist.sample(&mut rng);
         Some((cell, pattern))
     } else {
+        // All cells are collapsed
         None
     }
 }
@@ -351,17 +339,18 @@ enum PropagationResult {
 
 fn propagate(
     collapse: Collapse,
-    wave: &Wave,
+    wave: &mut Wave,
     patterns: &Patterns,
     width: u32,
     height: u32,
 ) -> PropagationResult {
     let (cell, pattern) = collapse;
-    let mut wave = wave.clone();
+    let mut p = HashSet::default();
+    p.insert(pattern);
     // Starting with the collapsed cell, propagating changes
-    let mut queue: Vec<(usize, HashSet<PatternId>)> = vec![(cell, [pattern].into())];
+    let mut queue: Vec<(usize, HashSet<PatternId>)> = vec![(cell, p)];
     // Keep track of changed cells to know which to recalculate entropy for
-    let mut changes: HashMap<usize, HashSet<PatternId>> = HashMap::new();
+    let mut changes: HashMap<usize, HashSet<PatternId>> = HashMap::default();
 
     while !queue.is_empty() {
         // `cell` is the cell we're propagating the collapse through, and `post_collapse` is
@@ -392,16 +381,13 @@ fn propagate(
                     // of this cell's possible patterns.
                     let compatibles = wave[cell]
                         .iter()
-                        .map(|&i| patterns.compatibles(i, &direction))
+                        .map(|&i| patterns.compatibles(i, &direction).clone())
                         .reduce(|a, b| {
                             let mut a = a;
                             a.extend(b);
                             a
                         })
-                        .expect(&format!(
-                            "Unnexpected lack of possibilities for {:?} of {:?}",
-                            direction, wave[cell]
-                        ));
+                        .unwrap();
                     queue.push((neighbor.unwrap(), compatibles));
                 });
         }
@@ -411,10 +397,16 @@ fn propagate(
 }
 
 type Collapse = (usize, PatternId);
-type PatternSet = HashSet<PatternId>;
 type CollapseHistory = Vec<(Collapse, HashMap<usize, PatternSet>)>;
 
-pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height: u32) {
+pub fn wave_function_collapse(
+    image: &RgbaImage,
+    n: u32,
+    m: u32,
+    width: u32,
+    height: u32,
+    anim: bool,
+) {
     // Number of digits to display the number of cells
     let rem_width = format!("{}", width * height).len();
 
@@ -423,7 +415,8 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
     // Observation stack
     let mut history: CollapseHistory = Vec::new();
     // Overserve-propagate-update loop
-    let mut iter_num: usize = 0;
+    let mut iter_num = 0;
+    let time = std::time::Instant::now();
     loop {
         iter_num += 1;
         // Observe and collapse a new cell or break if there are no unobserved cells
@@ -445,37 +438,40 @@ pub fn wave_function_collapse(image: &Image, n: u32, m: u32, width: u32, height:
         );
 
         // Propagate this collapse
-        match propagate(collapse, &wave, &patterns, width, height) {
+        match propagate(collapse, &mut wave, &patterns, width, height) {
             // Update entropies
             PropagationResult::Success(changes) => {
                 history.push((collapse, changes.clone()));
-                changes.into_iter().for_each(|(cell, mask)| {
-                    wave[cell] = mask;
-                    entropy[cell] = calculate_entropy(&wave[cell], &patterns)
-                });
+                changes
+                    .into_iter()
+                    .for_each(|(cell, mask)| entropy[cell] = calculate_entropy(&mask, &patterns));
             }
             // Restart
             PropagationResult::Contradiction => {
                 eprintln!("\nRestarting...");
                 restarts += 1;
                 (patterns, wave, entropy) = initialize(image, n, m, width, height);
-                history.drain(1..);
-                iter_num = 0;
+                history.drain(0..);
                 // Observe again
                 continue;
             }
         }
     }
     println!(
-        "\rFinished after {} restarts and {} iterations",
+        "\rFinished after {} restarts and {} iterations, {}us per iter",
         restarts,
-        iter_num - 1
+        iter_num - 1,
+        time.elapsed().as_micros() / iter_num
     );
 
     // Animate
-    animate(&history, &patterns, width, height, 10);
-    let mut image = draw(&wave, &patterns, width as usize, height as usize, 10);
-    image.save("data/output.png");
+    if anim {
+        animate(&history, &patterns, width, height, 10);
+        let image = draw(&wave, &patterns, width as usize, height as usize, 10);
+        image
+            .save("data/output.png")
+            .expect("Unable to save final png");
+    }
 }
 
 fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u32, scale: u32) {
@@ -488,13 +484,15 @@ fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u
 
     // The first frame is the average of all the patterns
     let all_patterns: HashSet<usize> = (0..patterns.len()).collect();
-    let background = get_average_color(&all_patterns, &patterns);
+    let background = get_average_color(&all_patterns, patterns);
     let mut frame = background.repeat((scale * width * scale * height) as usize);
 
     let duration = 5;
-    let delay = std::cmp::max(20, (duration * 1000) / history.len() as i32);
+    // Delay is ms per iteration, bounded in [20, 1000]
+    let delay = (duration * 1000) / history.len() as i32;
+    let delay = std::cmp::max(20, delay);
+    let delay = std::cmp::min(1000, delay);
     let skip_by = std::cmp::max(1, history.len() as i32 / (duration * (1000 / delay))) as usize;
-    println!("{} {} {}", delay, 1000.0 / delay as f32, skip_by);
     // Create the next frame by copying the last and only modifying the changed cells
     history.iter().enumerate().for_each(|(i, (_, diffs))| {
         eprint!(
@@ -503,7 +501,6 @@ fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u
             history.len()
         );
         if i % skip_by == 0 {
-            eprint!("rending {i}");
             encoder
                 .add_frame(&frame, (i / skip_by) as i32 * delay)
                 .unwrap();
@@ -519,7 +516,7 @@ fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u
             let index = *index as u32;
             let (x, y) = (index % width, index / width);
             let color = get_average_color(mask, patterns);
-            put_pixel_scaled(&mut frame, scale, width, x, y, color)
+            put_pixel_scaled(&mut frame, scale, width, x, y, *color)
         });
     });
     encoder
@@ -554,31 +551,23 @@ fn put_pixel_scaled(data: &mut [u8], scale: u32, width: u32, x: u32, y: u32, col
     }
 }
 
-fn get_average_color(mask: &HashSet<usize>, patterns: &Patterns) -> [u8; 4] {
-    let frequencies: Vec<f32> = patterns
-        .frequencies(mask)
-        .into_iter()
-        .map(|f| f as f32)
-        .collect();
+/// Get the average color of patterns in the mask weighted by their frequency
+fn get_average_color(mask: &PatternSet, patterns: &Patterns) -> Pixel {
+    let frequencies: Vec<f32> = patterns.frequencies(mask).map(|f| f as f32).collect();
     let total: f32 = frequencies.iter().sum();
-    let rgb = Rgb(frequencies
-        .iter()
-        .enumerate()
-        .map(|(pattern, freq)| {
-            patterns
-                .top_left_color(pattern)
-                .0
-                .map(|c| c as f32 * freq / total)
-        })
-        .reduce(|a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]])
-        .unwrap()
-        .map(|c| c as u8))
-    .0;
-    [rgb[0], rgb[1], rgb[2], 255]
+    Pixel(
+        frequencies
+            .iter()
+            .enumerate()
+            .map(|(pattern, freq)| patterns.color(pattern).map(|c| c as f32 * freq / total))
+            .reduce(|a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]])
+            .unwrap()
+            .map(|c| c as u8),
+    )
 }
 
 fn draw(
-    wave: &Vec<HashSet<usize>>,
+    wave: &[HashSet<usize>],
     patterns: &Patterns,
     width: usize,
     height: usize,
@@ -588,13 +577,13 @@ fn draw(
     (0..width).for_each(|x| {
         (0..height).for_each(|y| {
             let possibilities = &wave[(x + width * y) as usize];
-            let color = get_average_color(possibilities, &patterns);
+            let color = get_average_color(possibilities, patterns);
             (0..scale).for_each(|dx| {
                 (0..scale).for_each(|dy| {
                     image.put_pixel(
                         (scale * x + dx) as u32,
                         (scale * y + dy) as u32,
-                        Rgba(color),
+                        Rgba(*color),
                     );
                 })
             })
@@ -607,10 +596,4 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
 }
