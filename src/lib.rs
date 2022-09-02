@@ -40,7 +40,7 @@ impl Set {
         self.iter().next().is_none()
     }
 
-    fn iter<'a>(&'a self) -> impl Iterator<Item = usize> + 'a {
+    fn iter(&'_ self) -> impl Iterator<Item = usize> + '_ {
         self.0
             .iter()
             .enumerate()
