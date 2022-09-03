@@ -252,6 +252,11 @@ impl Patterns {
             }
         }
 
+        // Sort the patterns by the number of times they occured to allow for deterministic
+        // generation.
+        let mut patterns: Vec<(Pattern, u32)> = patterns.into_iter().collect();
+        patterns.sort_by_key(|(_, count)| *count);
+
         // TODO: Augment pattern data with rotations and reflections
 
         // From here on, we no longer care about the source image
@@ -266,8 +271,6 @@ impl Patterns {
                 let pixel = pattern.0[0];
                 let adjacency = DIRECTIONS.map(|direction| {
                     let overlap = pattern.overlap(&direction, pattern_width, pattern_height);
-                    // This relies on the HashMap iterating in the same order both times, which
-                    // works right now, but I do not believe is guaranteed to work.
                     // Patterns than can be to the `direction` of this pattern
                     patterns
                         .iter()
@@ -419,7 +422,12 @@ fn initialize(
     (patterns, wave, entropy)
 }
 
-fn observe(wave: &Wave, entropy: &[f32], patterns: &Patterns) -> Option<Collapse> {
+fn observe(
+    wave: &Wave,
+    entropy: &[f32],
+    patterns: &Patterns,
+    rng: &mut impl Rng,
+) -> Option<Collapse> {
     // Get the cell with the least nonzero entropy
     if let Some((cell, _)) = entropy
         .iter()
@@ -430,8 +438,7 @@ fn observe(wave: &Wave, entropy: &[f32], patterns: &Patterns) -> Option<Collapse
         // Randomly pick a pattern from the cell's possible patterns, weighted by times that
         // pattern occurred in the seed
         let dist = WeightedIndex::new(patterns.frequencies(&wave[cell])).unwrap();
-        let mut rng = thread_rng();
-        let pattern = dist.sample(&mut rng);
+        let pattern = dist.sample(rng);
         Some((cell, pattern))
     } else {
         // All cells are collapsed
@@ -463,18 +470,16 @@ fn propagate(
         let (cell, post_collapse) = queue.pop().unwrap();
         assert!(!post_collapse.is_empty());
 
-        // Only propagate from this cell if this cell has fewer options
+        // Only propagate from this cell if it will have fewer options
         let prev = wave[cell].len();
-        wave[cell] = &wave[cell] & &post_collapse; // wave[cell].intersection(&post_collapse).copied().collect();
+        wave[cell] = &wave[cell] & &post_collapse;
 
         // If this cell has no possibilities, the algorithm has run into a contradiction
         if wave[cell].is_empty() {
-            println!("\n contradiction with {cell}");
             return PropagationResult::Contradiction;
         }
 
         if prev != wave[cell].len() {
-            // Insert (overwrite, even) these changes
             changes.insert(cell, wave[cell].clone());
             // Propagate changes to neighbors
             get_neighbors(cell, width, height)
@@ -506,10 +511,12 @@ pub fn wave_function_collapse(
     width: u32,
     height: u32,
     anim: bool,
+    seed: u64,
 ) {
     // Number of digits to display the number of cells
     let rem_width = format!("{}", width * height).len();
 
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let (mut patterns, mut wave, mut entropy) = initialize(image, n, m, width, height);
     let mut restarts = 0;
     // Observation stack
@@ -520,7 +527,7 @@ pub fn wave_function_collapse(
     loop {
         iter_num += 1;
         // Observe and collapse a new cell or break if there are no unobserved cells
-        let collapse: Collapse = match observe(&wave, &entropy, &patterns) {
+        let collapse: Collapse = match observe(&wave, &entropy, &patterns, &mut rng) {
             Some((c, p)) => (c, p),
             None => break,
         };
@@ -576,7 +583,7 @@ pub fn wave_function_collapse(
 
 fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u32, scale: u32) {
     let file = File::create("data/output.gif").unwrap();
-    let mut gif = GifEncoder::new_with_speed(file, 10);
+    let mut gif = GifEncoder::new_with_speed(file, 30);
     gif.set_repeat(image::codecs::gif::Repeat::Infinite)
         .unwrap();
     let mut encoder = Encoder::new((scale * width, scale * height)).unwrap();
