@@ -4,6 +4,7 @@ use image::Rgba;
 use image::RgbaImage;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::fs::File;
 use std::hash::Hash;
@@ -398,28 +399,17 @@ fn get_neighbors(cell: usize, width: u32, height: u32) -> [Option<usize>; 4] {
 
 type Wave = Vec<PatternSet>;
 
-fn initialize(
-    image: &RgbaImage,
-    n: u32,
-    m: u32,
-    width: u32,
-    height: u32,
-) -> (Patterns, Wave, Vec<f32>) {
-    // Find the patterns from the source image
-    let patterns = Patterns::from_image(image, n, m);
-    eprintln!("Found {} patterns", patterns.len());
-
+fn initialize(patterns: &Patterns, width: u32, height: u32) -> (Wave, Vec<f32>) {
     // Initialize the wave so each cell is in a superposition of all patterns
     let all_patterns = patterns.set_all();
-    let wave: Vec<PatternSet> = (0..(width * height))
-        .map(|_| all_patterns.clone())
-        .collect();
+    let mut wave: Vec<PatternSet> = Vec::with_capacity((width * height) as usize);
+    wave.resize((width * height) as usize, all_patterns.clone());
 
     // Each cell has the same entropy at the start
     let entropy = calculate_entropy(&all_patterns, &patterns);
     let entropy = [entropy].repeat(wave.len());
 
-    (patterns, wave, entropy)
+    (wave, entropy)
 }
 
 fn observe(
@@ -513,15 +503,21 @@ pub fn wave_function_collapse(
     anim: bool,
     seed: u64,
 ) {
+    // Find the patterns from the source image
+    let patterns = Patterns::from_image(image, n, m);
+    eprintln!("Found {} patterns", patterns.len());
+
     // Number of digits to display the number of cells
     let rem_width = format!("{}", width * height).len();
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-    let (mut patterns, mut wave, mut entropy) = initialize(image, n, m, width, height);
-    let mut restarts = 0;
+    let (mut wave, mut entropy) = initialize(&patterns, width, height);
+
     // Observation stack
     let mut history: CollapseHistory = Vec::new();
+
     // Overserve-propagate-update loop
+    let mut restarts = 0;
     let mut iter_num = 0;
     let time = std::time::Instant::now();
     loop {
@@ -557,14 +553,15 @@ pub fn wave_function_collapse(
             PropagationResult::Contradiction => {
                 eprintln!("\nRestarting...");
                 restarts += 1;
-                (patterns, wave, entropy) = initialize(image, n, m, width, height);
+                (wave, entropy) = initialize(&patterns, width, height);
                 history.drain(0..);
                 // Observe again
                 continue;
             }
         }
     }
-    println!(
+
+    eprintln!(
         "\rFinished after {} restarts and {} iterations, {}us per iter",
         restarts,
         iter_num - 1,
@@ -582,6 +579,8 @@ pub fn wave_function_collapse(
 }
 
 fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u32, scale: u32) {
+    assert!(!history.is_empty());
+
     let file = File::create("data/output.gif").unwrap();
     let mut gif = GifEncoder::new_with_speed(file, 30);
     gif.set_repeat(image::codecs::gif::Repeat::Infinite)
