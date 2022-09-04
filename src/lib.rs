@@ -4,7 +4,6 @@ use image::Rgba;
 use image::RgbaImage;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
-use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::fs::File;
 use std::hash::Hash;
@@ -64,6 +63,7 @@ impl std::ops::IndexMut<usize> for Set {
     }
 }
 
+/// Intersection
 impl std::ops::BitAnd<&Set> for &Set {
     type Output = Set;
 
@@ -77,6 +77,7 @@ impl std::ops::BitAnd<&Set> for &Set {
     }
 }
 
+/// Union
 impl std::ops::BitOr<&Set> for &Set {
     type Output = Set;
 
@@ -89,6 +90,21 @@ impl std::ops::BitOr<&Set> for &Set {
             .collect()
     }
 }
+
+/// Set difference
+impl std::ops::Sub<&Set> for &Set {
+    type Output = Set;
+
+    fn sub(self, rhs: &Set) -> Self::Output {
+        assert!(self.0.len() == rhs.0.len());
+        self.0
+            .iter()
+            .zip(rhs.0.iter())
+            .map(|(&l, &r)| if r { false } else { l })
+            .collect()
+    }
+}
+
 impl std::fmt::Display for Set {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let contents = self.iter().enumerate().fold(String::new(), |acc, (i, n)| {
@@ -145,8 +161,6 @@ const DIRECTIONS: [Direction; 4] = [
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 struct Pixel([u8; 4]);
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct Pattern(Vec<Pixel>);
 
 impl std::ops::Index<usize> for Pixel {
     type Output = u8;
@@ -183,6 +197,9 @@ impl From<Rgba<u8>> for Pixel {
     }
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct Pattern(Vec<Pixel>);
+
 impl Pattern {
     /// Get the part of the pattern that would overlap with the pattern to the direction of this
     /// pattern by removing the opposite sides last row/col, e.g. to get the left overlap remove
@@ -205,6 +222,85 @@ impl Pattern {
             })
             .map(|(_, p)| *p)
             .collect()
+    }
+
+    /// The identity map for Pattern. A little silly, but this way D_8 can be a constant.
+    fn identity(self, _: u32, _: u32) -> Self {
+        self
+    }
+
+    /// Action of r in D_8 on a pattern, 90 degree clockwise rotation.
+    fn rotate(self, width: u32, height: u32) -> Self {
+        // a b c    g d a
+        // d e f -> h e b
+        // g h i    i f c
+        // This will only work with square patterns
+        assert_eq!(width, height);
+        let mut pixels: Vec<(u32, Pixel)> = self
+            .0
+            .iter()
+            .enumerate()
+            // Index to u32, copy pixel
+            .map(|(i, p)| (i as u32, *p))
+            // Index to coordinates
+            .map(|(i, p)| (i % width, i / width, p))
+            // Rotate
+            .map(|(x, y, p)| (width - 1 - y, x, p))
+            // Coordinates back to index
+            .map(|(x, y, p)| (x + y * width, p))
+            .collect();
+        pixels.sort_by_key(|(i, _)| *i);
+        let pixels = pixels.into_iter().map(|(_, p)| p).collect();
+        Pattern(pixels)
+    }
+
+    /// Action of s in D_8 on a pattern, horizontal reflection.
+    fn reflect(self, width: u32, _: u32) -> Self {
+        // a b c    c b a
+        // d e f -> f e d
+        // g h i    i h g
+        let mut pixels: Vec<(u32, Pixel)> = self
+            .0
+            .iter()
+            .enumerate()
+            // Index to u32, copy pixel
+            .map(|(i, p)| (i as u32, *p))
+            // Index to coordinates
+            .map(|(i, p)| (i % width, i / width, p))
+            // Reflect
+            .map(|(x, y, p)| (width - 1 - x, y, p))
+            // Coordinates back to index
+            .map(|(x, y, p)| (x + y * width, p))
+            .collect();
+        pixels.sort_by_key(|(i, _)| *i);
+        let pixels = pixels.into_iter().map(|(_, p)| p).collect();
+        Pattern(pixels)
+    }
+
+    /// Get the orbit of D8 containing this pattern, but only the different patterns (skip the
+    /// identity action).
+    fn orbit_of_d8(&self, width: u32, height: u32) -> [Pattern; 7] {
+        const E: D8PatternAction = Pattern::identity;
+        const R: D8PatternAction = Pattern::rotate;
+        const S: D8PatternAction = Pattern::reflect;
+        // D_8 (less the identity) is r, r^2, r^3, s, sr, sr^2, sr^3
+        const D8: [[D8PatternAction; 4]; 7] = [
+            [R, E, E, E],
+            [R, R, E, E],
+            [R, R, R, E],
+            [S, E, E, E],
+            [S, R, E, E],
+            [S, R, R, E],
+            [S, R, R, R],
+        ];
+
+        D8.map(|g| {
+            g.iter()
+                // Reverse the action so it can be written as a vec in the same order
+                // as the expression (sr means rotate then reflect)
+                .rev()
+                .fold(self.clone(), |p, g| g(p, width, height))
+        })
     }
 }
 
@@ -229,8 +325,10 @@ type PatternId = usize;
 type PatternSet = Set;
 struct Patterns(Vec<PatternInfo>);
 
+type D8PatternAction = fn(Pattern, u32, u32) -> Pattern;
+
 impl Patterns {
-    fn from_image(image: &RgbaImage, pattern_width: u32, pattern_height: u32) -> Self {
+    fn from_image(image: &RgbaImage, pattern_width: u32, pattern_height: u32, sym: bool) -> Self {
         let (width, height) = image.dimensions();
 
         // Get the `pattern_width` by `pattern_height` patterns with top-left corner at (x, y),
@@ -253,12 +351,25 @@ impl Patterns {
             }
         }
 
+        // Augment pattern data with rotations and reflections
+        if sym {
+            patterns.clone().into_iter().for_each(|(pattern, count)| {
+                pattern
+                    .orbit_of_d8(pattern_width, pattern_height)
+                    .into_iter()
+                    .for_each(|p| {
+                        patterns
+                            .entry(p)
+                            .and_modify(|c| *c += count)
+                            .or_insert(count);
+                    });
+            });
+        }
+
         // Sort the patterns by the number of times they occured to allow for deterministic
         // generation.
         let mut patterns: Vec<(Pattern, u32)> = patterns.into_iter().collect();
         patterns.sort_by_key(|(_, count)| *count);
-
-        // TODO: Augment pattern data with rotations and reflections
 
         // From here on, we no longer care about the source image
 
@@ -298,6 +409,10 @@ impl Patterns {
 
     fn set_all(&self) -> PatternSet {
         Set::with_all(self.len())
+    }
+
+    fn set_all_except(&self, pattern: PatternId) -> PatternSet {
+        &self.set_all() - &self.set_with(pattern)
     }
 
     fn set_with(&self, pattern: PatternId) -> PatternSet {
@@ -501,10 +616,11 @@ pub fn wave_function_collapse(
     width: u32,
     height: u32,
     anim: bool,
+    sym: bool,
     seed: u64,
 ) {
     // Find the patterns from the source image
-    let patterns = Patterns::from_image(image, n, m);
+    let patterns = Patterns::from_image(image, n, m, sym);
     eprintln!("Found {} patterns", patterns.len());
 
     // Number of digits to display the number of cells
@@ -701,4 +817,114 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pattern_builder(reds: &[u8]) -> Pattern {
+        let pixels = reds.into_iter().map(|r| Pixel([*r, 0, 0, 0])).collect();
+        Pattern(pixels)
+    }
+
+    #[test]
+    fn test_rotate() {
+        // 0 1 2
+        // 3 4 5
+        // 6 7 8
+        let pattern = Pattern(vec![
+            Pixel([0, 0, 0, 0]),
+            Pixel([1, 0, 0, 0]),
+            Pixel([2, 0, 0, 0]),
+            Pixel([3, 0, 0, 0]),
+            Pixel([4, 0, 0, 0]),
+            Pixel([5, 0, 0, 0]),
+            Pixel([6, 0, 0, 0]),
+            Pixel([7, 0, 0, 0]),
+            Pixel([8, 0, 0, 0]),
+        ]);
+        // 6 3 0
+        // 7 4 1
+        // 8 5 2
+        let rotation = Pattern(vec![
+            Pixel([6, 0, 0, 0]),
+            Pixel([3, 0, 0, 0]),
+            Pixel([0, 0, 0, 0]),
+            Pixel([7, 0, 0, 0]),
+            Pixel([4, 0, 0, 0]),
+            Pixel([1, 0, 0, 0]),
+            Pixel([8, 0, 0, 0]),
+            Pixel([5, 0, 0, 0]),
+            Pixel([2, 0, 0, 0]),
+        ]);
+        assert_eq!(pattern.rotate(3, 3), rotation);
+    }
+
+    #[test]
+    fn test_reflect() {
+        // 0 1 2
+        // 3 4 5
+        // 6 7 8
+        let pattern = Pattern(vec![
+            Pixel([0, 0, 0, 0]),
+            Pixel([1, 0, 0, 0]),
+            Pixel([2, 0, 0, 0]),
+            Pixel([3, 0, 0, 0]),
+            Pixel([4, 0, 0, 0]),
+            Pixel([5, 0, 0, 0]),
+            Pixel([6, 0, 0, 0]),
+            Pixel([7, 0, 0, 0]),
+            Pixel([8, 0, 0, 0]),
+        ]);
+        // 2 1 0
+        // 5 4 3
+        // 8 7 6
+        let reflection = Pattern(vec![
+            Pixel([2, 0, 0, 0]),
+            Pixel([1, 0, 0, 0]),
+            Pixel([0, 0, 0, 0]),
+            Pixel([5, 0, 0, 0]),
+            Pixel([4, 0, 0, 0]),
+            Pixel([3, 0, 0, 0]),
+            Pixel([8, 0, 0, 0]),
+            Pixel([7, 0, 0, 0]),
+            Pixel([6, 0, 0, 0]),
+        ]);
+        assert_eq!(pattern.reflect(3, 3), reflection)
+    }
+
+    #[test]
+    fn test_d8() {
+        // 0 1 2
+        // 3 4 5
+        // 6 7 8
+        let pattern = pattern_builder(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let orbit = [
+            // 6 3 0
+            // 7 4 1
+            // 8 5 2
+            pattern_builder(&[6, 3, 0, 7, 4, 1, 8, 5, 2]),
+            // 8 7 6
+            // 5 4 3
+            // 2 1 0
+            pattern_builder(&[8, 7, 6, 5, 4, 3, 2, 1, 0]),
+            // 2 5 8
+            // 1 4 7
+            // 0 3 6
+            pattern_builder(&[2, 5, 8, 1, 4, 7, 0, 3, 6]),
+            // 2 1 0
+            // 5 4 3
+            // 8 7 6
+            pattern_builder(&[2, 1, 0, 5, 4, 3, 8, 7, 6]),
+            // 0 3 6
+            // 1 4 7
+            // 2 5 8
+            pattern_builder(&[0, 3, 6, 1, 4, 7, 2, 5, 8]),
+            // 6 7 8
+            // 3 4 5
+            // 0 1 2
+            pattern_builder(&[6, 7, 8, 3, 4, 5, 0, 1, 2]),
+            // 8 5 2
+            // 7 4 1
+            // 6 3 0
+            pattern_builder(&[8, 5, 2, 7, 4, 1, 6, 3, 0]),
+        ];
+        assert_eq!(pattern.orbit_of_d8(3, 3), orbit)
+    }
 }

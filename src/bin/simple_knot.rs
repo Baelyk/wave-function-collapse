@@ -8,6 +8,7 @@ fn main() {
         .unwrap()
         .into_rgba8();
 
-    wave_function_collapse(&source, 3, 3, 90, 90, true, 10);
+    wave_function_collapse(&source, 3, 3, 50, 50, true, true, 16);
+
     println!("FINISHED");
 }
