@@ -1,3 +1,4 @@
+use bit_set::BitSet;
 use image::codecs::gif::GifEncoder;
 use image::Frame;
 use image::Rgba;
@@ -9,120 +10,7 @@ use std::fs::File;
 use std::hash::Hash;
 use webp_animation::Encoder;
 
-/// A set of `usize`s to act as a pattern set
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Set(Vec<bool>);
-
-impl Set {
-    fn with_size(size: usize) -> Self {
-        Set(vec![false; size])
-    }
-
-    fn with_all(size: usize) -> Self {
-        Set(vec![true; size])
-    }
-
-    fn with_only(n: usize, size: usize) -> Self {
-        let mut set = Self::with_size(size);
-        set[n] = true;
-        set
-    }
-
-    fn contains(&self, n: usize) -> bool {
-        self[n]
-    }
-
-    fn len(&self) -> usize {
-        self.iter().count()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.iter().next().is_none()
-    }
-
-    fn iter(&'_ self) -> impl Iterator<Item = usize> + '_ {
-        self.0
-            .iter()
-            .enumerate()
-            .filter(|(_, &included)| included)
-            .map(|(i, _)| i)
-    }
-}
-
-impl std::ops::Index<usize> for Set {
-    type Output = bool;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.0[index]
-    }
-}
-
-impl std::ops::IndexMut<usize> for Set {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.0[index]
-    }
-}
-
-/// Intersection
-impl std::ops::BitAnd<&Set> for &Set {
-    type Output = Set;
-
-    fn bitand(self, rhs: &Set) -> Self::Output {
-        assert!(self.0.len() == rhs.0.len());
-        self.0
-            .iter()
-            .zip(rhs.0.iter())
-            .map(|(l, r)| *l && *r)
-            .collect()
-    }
-}
-
-/// Union
-impl std::ops::BitOr<&Set> for &Set {
-    type Output = Set;
-
-    fn bitor(self, rhs: &Set) -> Self::Output {
-        assert!(self.0.len() == rhs.0.len());
-        self.0
-            .iter()
-            .zip(rhs.0.iter())
-            .map(|(l, r)| *l || *r)
-            .collect()
-    }
-}
-
-/// Set difference
-impl std::ops::Sub<&Set> for &Set {
-    type Output = Set;
-
-    fn sub(self, rhs: &Set) -> Self::Output {
-        assert!(self.0.len() == rhs.0.len());
-        self.0
-            .iter()
-            .zip(rhs.0.iter())
-            .map(|(&l, &r)| if r { false } else { l })
-            .collect()
-    }
-}
-
-impl std::fmt::Display for Set {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let contents = self.iter().enumerate().fold(String::new(), |acc, (i, n)| {
-            if i == 0 {
-                format!("{n}")
-            } else {
-                format!("{acc}, {n}")
-            }
-        });
-        write!(f, "{{{}}}", contents)
-    }
-}
-
-impl FromIterator<bool> for Set {
-    fn from_iter<I: IntoIterator<Item = bool>>(iter: I) -> Self {
-        Set(iter.into_iter().collect())
-    }
-}
+type PatternSet = BitSet;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Direction {
@@ -280,9 +168,12 @@ impl Pattern {
     /// Get the orbit of D8 containing this pattern, but only the different patterns (skip the
     /// identity action).
     fn orbit_of_d8(&self, width: u32, height: u32) -> [Pattern; 7] {
+        type D8PatternAction = fn(Pattern, u32, u32) -> Pattern;
+
         const E: D8PatternAction = Pattern::identity;
         const R: D8PatternAction = Pattern::rotate;
         const S: D8PatternAction = Pattern::reflect;
+
         // D_8 (less the identity) is r, r^2, r^3, s, sr, sr^2, sr^3
         const D8: [[D8PatternAction; 4]; 7] = [
             [R, E, E, E],
@@ -322,10 +213,7 @@ impl PatternInfo {
 }
 
 type PatternId = usize;
-type PatternSet = Set;
 struct Patterns(Vec<PatternInfo>);
-
-type D8PatternAction = fn(Pattern, u32, u32) -> Pattern;
 
 impl Patterns {
     fn from_image(image: &RgbaImage, pattern_width: u32, pattern_height: u32, sym: bool) -> Self {
@@ -386,7 +274,8 @@ impl Patterns {
                     // Patterns than can be to the `direction` of this pattern
                     patterns
                         .iter()
-                        .map(|(other, _)| {
+                        .enumerate()
+                        .filter(|(_, (other, _))| {
                             overlap
                                 == other.overlap(
                                     &direction.opposite(),
@@ -394,6 +283,7 @@ impl Patterns {
                                     pattern_height,
                                 )
                         })
+                        .map(|(i, _)| i)
                         .collect()
                 });
                 PatternInfo(pixel, *count, adjacency)
@@ -404,19 +294,17 @@ impl Patterns {
     }
 
     fn set(&self) -> PatternSet {
-        Set::with_size(self.len())
+        BitSet::with_capacity(self.len())
     }
 
     fn set_all(&self) -> PatternSet {
-        Set::with_all(self.len())
-    }
-
-    fn set_all_except(&self, pattern: PatternId) -> PatternSet {
-        &self.set_all() - &self.set_with(pattern)
+        (0..self.len()).collect()
     }
 
     fn set_with(&self, pattern: PatternId) -> PatternSet {
-        Set::with_only(pattern, self.len())
+        let mut set = self.set();
+        set.insert(pattern);
+        set
     }
 
     fn len(&self) -> usize {
@@ -521,7 +409,7 @@ fn initialize(patterns: &Patterns, width: u32, height: u32) -> (Wave, Vec<f32>) 
     wave.resize((width * height) as usize, all_patterns.clone());
 
     // Each cell has the same entropy at the start
-    let entropy = calculate_entropy(&all_patterns, &patterns);
+    let entropy = calculate_entropy(&all_patterns, patterns);
     let entropy = [entropy].repeat(wave.len());
 
     (wave, entropy)
@@ -577,7 +465,7 @@ fn propagate(
 
         // Only propagate from this cell if it will have fewer options
         let prev = wave[cell].len();
-        wave[cell] = &wave[cell] & &post_collapse;
+        wave[cell].intersect_with(&post_collapse);
 
         // If this cell has no possibilities, the algorithm has run into a contradiction
         if wave[cell].is_empty() {
@@ -594,11 +482,12 @@ fn propagate(
                 .for_each(|(neighbor, direction)| {
                     // Compatibles is the set of all patterns that can be to `direction` of any
                     // of this cell's possible patterns.
-                    let compatibles = wave[cell]
+                    let mut compatibles = wave[cell]
                         .iter()
-                        .map(|i| patterns.compatibles(i, &direction))
-                        .fold(patterns.set(), |a, b| &a | b);
-                    queue.push((neighbor.unwrap(), compatibles));
+                        .map(|i| patterns.compatibles(i, &direction));
+                    let mut compatible = compatibles.next().unwrap().clone();
+                    compatibles.for_each(|set| compatible.union_with(set));
+                    queue.push((neighbor.unwrap(), compatible));
                 });
         }
     }
@@ -687,11 +576,11 @@ pub fn wave_function_collapse(
     // Animate
     if anim {
         animate(&history, &patterns, width, height, 10);
-        let image = draw(&wave, &patterns, width as usize, height as usize, 10);
-        image
-            .save("data/output.png")
-            .expect("Unable to save final png");
     }
+    let image = draw(&wave, &patterns, width as usize, height as usize, 10);
+    image
+        .save("data/output.png")
+        .expect("Unable to save final png");
 }
 
 fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u32, scale: u32) {
