@@ -455,13 +455,13 @@ fn propagate(
     // Starting with the collapsed cell, propagating changes
     let mut queue: Vec<(usize, PatternSet)> = vec![(cell, patterns.set_with(pattern))];
     // Keep track of changed cells to know which to recalculate entropy for
-    let mut changes: HashMap<usize, PatternSet> = HashMap::default();
+    let mut changed = BitSet::with_capacity(patterns.len());
 
     while !queue.is_empty() {
         // `cell` is the cell we're propagating the collapse through, and `post_collapse` is
         // the set of patterns this cell could be as a result of the collapse.
         let (cell, post_collapse) = queue.pop().unwrap();
-        assert!(!post_collapse.is_empty());
+        debug_assert!(!post_collapse.is_empty());
 
         // Only propagate from this cell if it will have fewer options
         let prev = wave[cell].len();
@@ -473,7 +473,7 @@ fn propagate(
         }
 
         if prev != wave[cell].len() {
-            changes.insert(cell, wave[cell].clone());
+            changed.insert(cell);
             // Propagate changes to neighbors
             get_neighbors(cell, width, height)
                 .into_iter()
@@ -492,7 +492,12 @@ fn propagate(
         }
     }
 
-    PropagationResult::Success(changes)
+    PropagationResult::Success(
+        changed
+            .into_iter()
+            .map(|cell| (cell, wave[cell].clone()))
+            .collect(),
+    )
 }
 
 type Collapse = (usize, PatternId);
@@ -549,10 +554,10 @@ pub fn wave_function_collapse(
         match propagate(collapse, &mut wave, &patterns, width, height) {
             // Update entropies
             PropagationResult::Success(changes) => {
-                history.push((collapse, changes.clone()));
                 changes
-                    .into_iter()
-                    .for_each(|(cell, mask)| entropy[cell] = calculate_entropy(&mask, &patterns));
+                    .iter()
+                    .for_each(|(cell, mask)| entropy[*cell] = calculate_entropy(mask, &patterns));
+                history.push((collapse, changes))
             }
             // Restart
             PropagationResult::Contradiction => {
