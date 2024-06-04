@@ -8,7 +8,8 @@ use rand::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::fs::File;
 use std::hash::Hash;
-use webp_animation::Encoder;
+use std::io::Cursor;
+use wasm_bindgen::prelude::*;
 
 type PatternSet = BitSet;
 
@@ -403,14 +404,17 @@ fn get_neighbors(cell: usize, width: u32, height: u32) -> [Option<usize>; 4] {
 type Wave = Vec<PatternSet>;
 
 fn initialize(patterns: &Patterns, width: u32, height: u32) -> (Wave, Vec<f32>) {
+    log("1");
     // Initialize the wave so each cell is in a superposition of all patterns
     let all_patterns = patterns.set_all();
     let mut wave: Vec<PatternSet> = Vec::with_capacity((width * height) as usize);
     wave.resize((width * height) as usize, all_patterns.clone());
+    log("2");
 
     // Each cell has the same entropy at the start
     let entropy = calculate_entropy(&all_patterns, patterns);
     let entropy = [entropy].repeat(wave.len());
+    log("3");
 
     (wave, entropy)
 }
@@ -503,34 +507,47 @@ fn propagate(
 type Collapse = (usize, PatternId);
 type CollapseHistory = Vec<(Collapse, HashMap<usize, PatternSet>)>;
 
+#[wasm_bindgen]
 pub fn wave_function_collapse(
-    image: &RgbaImage,
+    image_buffer: &[u8],
     n: u32,
     m: u32,
     width: u32,
     height: u32,
     anim: bool,
     sym: bool,
-    seed: u64,
-) {
+    seed: u32,
+) -> Vec<u8> {
+    log("Hello!");
+    let image: RgbaImage = image::load_from_memory(image_buffer)
+        .expect("Image should load")
+        .into_rgba8();
+
+    log("a");
     // Find the patterns from the source image
-    let patterns = Patterns::from_image(image, n, m, sym);
+    let patterns = Patterns::from_image(&image, n, m, sym);
     eprintln!("Found {} patterns", patterns.len());
 
+    log("b");
     // Number of digits to display the number of cells
     let rem_width = format!("{}", width * height).len();
 
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+    log("c");
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed.into());
     let (mut wave, mut entropy) = initialize(&patterns, width, height);
+    log("c1");
 
     // Observation stack
     let mut history: CollapseHistory = Vec::new();
+    log("c2");
 
     // Overserve-propagate-update loop
     let mut restarts = 0;
     let mut iter_num = 0;
-    let time = std::time::Instant::now();
+    log("c3");
+    log("d");
     loop {
+        log("loop");
         iter_num += 1;
         // Observe and collapse a new cell or break if there are no unobserved cells
         let collapse: Collapse = match observe(&wave, &entropy, &patterns, &mut rng) {
@@ -570,86 +587,38 @@ pub fn wave_function_collapse(
             }
         }
     }
+    log("e");
 
     eprintln!(
-        "\rFinished after {} restarts and {} iterations, {}us per iter",
+        "\rFinished after {} restarts and {} iterations",
         restarts,
         iter_num - 1,
-        time.elapsed().as_micros() / iter_num
     );
+    log("f");
 
     // Animate
     if anim {
         animate(&history, &patterns, width, height, 10);
     }
+    log("g");
     let image = draw(&wave, &patterns, width as usize, height as usize, 10);
+    log("h");
+    //image
+    //.save("data/output.png")
+    //.expect("Unable to save final png");
+    log("g");
+
+    let mut bytes = Vec::new();
+
     image
-        .save("data/output.png")
-        .expect("Unable to save final png");
+        .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("Unable to write");
+
+    bytes
 }
 
 fn animate(history: &CollapseHistory, patterns: &Patterns, width: u32, height: u32, scale: u32) {
-    assert!(!history.is_empty());
-
-    let file = File::create("data/output.gif").unwrap();
-    let mut gif = GifEncoder::new_with_speed(file, 30);
-    gif.set_repeat(image::codecs::gif::Repeat::Infinite)
-        .unwrap();
-    let mut encoder = Encoder::new((scale * width, scale * height)).unwrap();
-    let format_width = format!("{}", history.len()).len();
-
-    // The first frame is the average of all the patterns
-    let background = get_average_color(&patterns.set_all(), patterns);
-    let mut frame = background.repeat((scale * width * scale * height) as usize);
-
-    let duration = 5;
-    // Delay is ms per iteration, bounded in [20, 1000]
-    let delay = (duration * 1000) / history.len() as i32;
-    let delay = std::cmp::max(20, delay);
-    let delay = std::cmp::min(1000, delay);
-    let skip_by = std::cmp::max(1, history.len() as i32 / (duration * (1000 / delay))) as usize;
-    // Create the next frame by copying the last and only modifying the changed cells
-    history.iter().enumerate().for_each(|(i, (_, diffs))| {
-        eprint!(
-            "\rAnimating {:format_width$}/{:format_width$}",
-            i + 1,
-            history.len()
-        );
-        if i % skip_by == 0 {
-            encoder
-                .add_frame(&frame, (i / skip_by) as i32 * delay)
-                .unwrap();
-            let gif_frame = Frame::from_parts(
-                RgbaImage::from_vec(scale * width, scale * height, frame.clone()).unwrap(),
-                0,
-                0,
-                image::Delay::from_numer_denom_ms(delay as u32, 1),
-            );
-            gif.encode_frame(gif_frame).unwrap();
-        }
-        diffs.iter().for_each(|(index, mask)| {
-            let index = *index as u32;
-            let (x, y) = (index % width, index / width);
-            let color = get_average_color(mask, patterns);
-            put_pixel_scaled(&mut frame, scale, width, x, y, *color)
-        });
-    });
-    encoder
-        .add_frame(&frame, (history.len() / skip_by + 1) as i32 * delay)
-        .unwrap();
-    let gif_frame = Frame::from_parts(
-        RgbaImage::from_vec(scale * width, scale * height, frame.clone()).unwrap(),
-        0,
-        0,
-        image::Delay::from_numer_denom_ms(((history.len() / skip_by + 1) as i32 * delay) as u32, 1),
-    );
-    gif.encode_frame(gif_frame.clone()).unwrap();
-    println!("delay: {:?}", gif_frame.delay());
-
-    let data = encoder
-        .finalize(1000 + ((history.len() / skip_by + 1) as i32 * delay))
-        .unwrap();
-    std::fs::write("data/output.webp", data).unwrap();
+    unimplemented!()
 }
 
 fn put_pixel_scaled(data: &mut [u8], scale: u32, width: u32, x: u32, y: u32, color: [u8; 4]) {
@@ -821,4 +790,15 @@ mod tests {
         ];
         assert_eq!(pattern.orbit_of_d8(3, 3), orbit)
     }
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+}
+
+#[wasm_bindgen(start)]
+pub fn greet() {
+    log("Hello from Rust!");
 }

@@ -5,11 +5,15 @@ edition = "2021"
 autobins = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
+wasm-bindgen = "0.2.92"
+wasm-bindgen-futures = "0.4.42"
 image = "0.24.3"
-webp-animation = "0.7.0"
 rand = { version = "0.8.5", features = ["alloc", "small_rng"] }
+getrandom = { version = "0.2", features = ["js"] }
 rustc-hash = "1.1"
 rayon = "1.5"
 bit-set = "0.5"

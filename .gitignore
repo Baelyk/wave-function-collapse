@@ -1,3 +1,2 @@
-/target
-/Cargo.lock
-/data
+node_modules
+.DS_Store
