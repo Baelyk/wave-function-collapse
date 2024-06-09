@@ -4,6 +4,6 @@ import topLevelAwait from "vite-plugin-top-level-await";
 
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
-	base: "wave-function-collapse",
+	base: "/wave-function-collapse",
 	plugins: [wasm(), topLevelAwait()],
 }));
